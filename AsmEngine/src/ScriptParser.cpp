@@ -171,16 +171,28 @@ namespace AsmEngine {
             }
             else if (!inQuotes) {
                 if (c == '(') {
+                    // If we have accumulated a token, save it first
+                    if (!current.empty()) {
+                        tokens.push_back(current);
+                        current.clear();
+                    }
                     inParentheses = true;
                     parenDepth++;
-                    current += c;
+                    // Don't include the opening parenthesis in the token
                 }
                 else if (c == ')') {
                     parenDepth--;
                     if (parenDepth == 0) {
                         inParentheses = false;
+                        // Save the current token without the closing parenthesis
+                        if (!current.empty()) {
+                            tokens.push_back(current);
+                            current.clear();
+                        }
                     }
-                    current += c;
+                    else {
+                        current += c;
+                    }
                 }
                 else if ((c == ' ' || c == '\t' || c == ',') && !inParentheses) {
                     if (!current.empty()) {
@@ -188,7 +200,15 @@ namespace AsmEngine {
                         current.clear();
                     }
                 }
-                else {
+                else if (c == ',' && inParentheses) {
+                    // Inside parentheses, comma separates arguments
+                    if (!current.empty()) {
+                        tokens.push_back(current);
+                        current.clear();
+                    }
+                }
+                else if (c != ' ' && c != '\t') {
+                    // Skip spaces inside parentheses
                     current += c;
                 }
             }
