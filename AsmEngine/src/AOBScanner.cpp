@@ -53,7 +53,8 @@ namespace AsmEngine {
         while (stream >> token) {
             std::smatch match;
 
-            if (token == "?" || token == "??") {
+            // 支持 ?, ?? 和 * 作为通配符
+            if (token == "?" || token == "??" || token == "*") {
                 parsed.AddWildcard();
             }
             else if (std::regex_match(token, match, captureRegex)) {
