@@ -1,5 +1,10 @@
 #pragma once
 
+// ∑¿÷π Windows.h ∂®“Â min/max ∫Í
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include <Windows.h>
 #include <vector>
 #include <string>
