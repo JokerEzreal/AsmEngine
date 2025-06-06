@@ -1,0 +1,69 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="AsmEngine">
+      <UniqueIdentifier>{830daada-7d91-4a99-83af-33bbe8313f78}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="AsmEngine\include">
+      <UniqueIdentifier>{3bcfab26-8bde-4eff-b180-53978b4d639f}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="AsmEngine\src">
+      <UniqueIdentifier>{e78b47e2-eb71-4628-9b27-a8a3f6ce3fb5}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="include\AOBScanner.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\AsmEngine.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\AssemblyEngine.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\CaptureStorage.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\Common.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\MemoryManager.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\ScriptParser.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+    <ClInclude Include="include\SymbolManager.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\AsmEngine.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\AOBScanner.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\AssemblyEngine.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\CaptureStorage.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\main.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\MemoryManager.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ScriptParser.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\SymbolManager.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+  </ItemGroup>
+</Project>
