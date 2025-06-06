@@ -305,7 +305,8 @@ namespace AsmEngine {
         return detour;
     }
 
-    std::optional<HookInfo> AssemblyEngine::CreateHook(AddressType targetAddress,
+    // 在 AssemblyEngine.cpp 中修复 CreateHook 函数
+    std::optional<AssemblyEngine::HookInfo> AssemblyEngine::CreateHook(AddressType targetAddress,
         const std::string& hookCode) {
         // This is a simplified hook creator
         // Full implementation would need memory allocation,

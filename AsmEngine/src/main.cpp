@@ -2,20 +2,21 @@
 #include <iostream>
 #include <iomanip>
 
-using namespace AsmEngine;
+// 不要使用 using namespace AsmEngine;
+// 而是使用具体的类型别名或完整限定名
 
 // Example: Using the engine to patch a game
 void ExampleGamePatch() {
     std::cout << "=== Game Patching Example ===" << std::endl;
 
     // Create engine with custom configuration
-    EngineConfig config;
+    AsmEngine::EngineConfig config;
     config.enableDebugPrivileges = true;
     config.autoCleanupOnExit = false;  // Keep patches active
     config.enableSymbolPersistence = true;
     config.symbolPersistenceFile = "game_symbols.dat";
 
-    AsmEngine engine(config);
+    AsmEngine::AsmEngine engine(config);  // 使用完整限定名
 
     // Attach to game process
     if (!engine.AttachToProcess("game.exe")) {
@@ -126,7 +127,7 @@ unregistersymbol(PlayerBase)
 void ExampleManualOperations() {
     std::cout << "\n=== Manual Operations Example ===" << std::endl;
 
-    AsmEngine engine;
+    AsmEngine::AsmEngine engine;  // 使用完整限定名
 
     // Attach to process by PID
     DWORD pid = 1234; // Replace with actual PID
@@ -149,22 +150,22 @@ void ExampleManualOperations() {
         if (s1 && s2) {
             std::cout << "Captured s1 = " << static_cast<int>(s1->AsUInt8()) << std::endl;
             std::cout << "Captured s2 = " << static_cast<int>(s2->AsUInt8()) << std::endl;
-        }
 
-        // Allocate memory
-        AddressType codeAddress = engine.AllocateMemory("MyCode", 4096);
-        std::cout << "Allocated memory at: 0x" << std::hex << codeAddress << std::endl;
+            // Allocate memory
+            AsmEngine::AddressType codeAddress = engine.AllocateMemory("MyCode", 4096);
+            std::cout << "Allocated memory at: 0x" << std::hex << codeAddress << std::endl;
 
-        // Write assembly using captured values
-        std::stringstream asmCode;
-        asmCode << "push rax\n";
-        asmCode << "mov rax, [rsp+" << static_cast<int>(s1->AsUInt8()) << "]\n";
-        asmCode << "add rax, " << static_cast<int>(s2->AsUInt8()) << "\n";
-        asmCode << "pop rax\n";
-        asmCode << "ret\n";
+            // Write assembly using captured values
+            std::stringstream asmCode;
+            asmCode << "push rax\n";
+            asmCode << "mov rax, [rsp+" << static_cast<int>(s1->AsUInt8()) << "]\n";
+            asmCode << "add rax, " << static_cast<int>(s2->AsUInt8()) << "\n";
+            asmCode << "pop rax\n";
+            asmCode << "ret\n";
 
-        if (engine.WriteAssembly(codeAddress, asmCode.str())) {
-            std::cout << "Assembly written successfully!" << std::endl;
+            if (engine.WriteAssembly(codeAddress, asmCode.str())) {
+                std::cout << "Assembly written successfully!" << std::endl;
+            }
         }
     }
 }
@@ -173,15 +174,15 @@ void ExampleManualOperations() {
 void ExampleBatchOperations() {
     std::cout << "\n=== Batch Operations Example ===" << std::endl;
 
-    AsmEngine engine;
+    AsmEngine::AsmEngine engine;  // 使用完整限定名
     engine.AttachToProcess("target.exe");
 
     // Create batch operations
-    std::vector<AsmEngine::BatchOperation> operations;
+    std::vector<AsmEngine::AsmEngine::BatchOperation> operations;
 
     // Scan for pattern
     operations.push_back({
-        AsmEngine::BatchOperation::Scan,
+        AsmEngine::AsmEngine::BatchOperation::Scan,
         "module.dll",
         "48 8B 05 ? ? ? ? 48 85 C0",
         0
@@ -189,7 +190,7 @@ void ExampleBatchOperations() {
 
     // Allocate memory
     operations.push_back({
-        AsmEngine::BatchOperation::Allocate,
+        AsmEngine::AsmEngine::BatchOperation::Allocate,
         "CodeCave",
         "",
         1024
@@ -197,7 +198,7 @@ void ExampleBatchOperations() {
 
     // Write assembly
     operations.push_back({
-        AsmEngine::BatchOperation::Write,
+        AsmEngine::AsmEngine::BatchOperation::Write,
         "CodeCave",
         "mov rax, 0x12345678\nret",
         0
@@ -205,7 +206,7 @@ void ExampleBatchOperations() {
 
     // Create hook
     operations.push_back({
-        AsmEngine::BatchOperation::Hook,
+        AsmEngine::AsmEngine::BatchOperation::Hook,
         "TargetFunction",
         "call CodeCave\nret",
         0
@@ -221,10 +222,10 @@ void ExampleBatchOperations() {
 void ExampleErrorHandling() {
     std::cout << "\n=== Error Handling Example ===" << std::endl;
 
-    AsmEngine engine;
+    AsmEngine::AsmEngine engine;  // 使用完整限定名
 
     // Set custom error handler
-    engine.SetErrorHandler([](ErrorCode code, const std::string& message) {
+    engine.SetErrorHandler([](AsmEngine::ErrorCode code, const std::string& message) {
         std::cerr << "Engine Error [" << static_cast<int>(code) << "]: "
             << message << std::endl;
         });
@@ -240,12 +241,12 @@ void ExampleQuickOperations() {
     DWORD pid = 1234; // Replace with actual PID
 
     // Quick scan
-    auto address = Quick::Scan(pid, "48 89 5C 24 08");
+    auto address = AsmEngine::Quick::Scan(pid, "48 89 5C 24 08");
     if (address) {
         std::cout << "Found at: 0x" << std::hex << *address << std::endl;
 
         // Quick read
-        auto data = Quick::Read(pid, *address, 16);
+        auto data = AsmEngine::Quick::Read(pid, *address, 16);
         if (data) {
             std::cout << "Read data: ";
             for (uint8_t byte : *data) {
@@ -256,8 +257,8 @@ void ExampleQuickOperations() {
         }
 
         // Quick write
-        ByteVector newData = { 0x90, 0x90, 0x90, 0x90, 0x90 }; // NOPs
-        if (Quick::Write(pid, *address, newData)) {
+        AsmEngine::ByteVector newData = { 0x90, 0x90, 0x90, 0x90, 0x90 }; // NOPs
+        if (AsmEngine::Quick::Write(pid, *address, newData)) {
             std::cout << "Write successful!" << std::endl;
         }
     }
@@ -275,7 +276,7 @@ int main() {
 
         std::cout << "\nAll examples completed!" << std::endl;
     }
-    catch (const EngineException& e) {
+    catch (const AsmEngine::EngineException& e) {
         std::cerr << "Engine exception: " << e.what() << std::endl;
         return 1;
     }
@@ -346,7 +347,7 @@ CharacterStruct:
 // Example: Creating a trainer menu
 class SimpleTrainer {
 private:
-    AsmEngine engine_;
+    AsmEngine::AsmEngine engine_;  // 使用完整限定名
     bool attached_ = false;
 
 public:
@@ -461,7 +462,7 @@ private:
 
         std::cout << "\nCaptured Values:" << std::endl;
         for (const auto& [name, value] : captures) {
-            std::cout << "  " << name << " = " << BytesToString(value.data)
+            std::cout << "  " << name << " = " << AsmEngine::BytesToString(value.data)
                 << std::endl;
         }
 
