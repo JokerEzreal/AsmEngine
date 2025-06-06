@@ -1,4 +1,0 @@
-﻿cl : command line  warning D9025: overriding '/sdl' with '/GS-'
-  AOBScanner.cpp
-psapi.lib(PSAPI.DLL) : warning LNK4006: __NULL_IMPORT_DESCRIPTOR already defined in ntdll.lib(ntdll.dll); second definition ignored
-  AsmEngine.vcxproj -> C:\Users\Administrator\Desktop\AsmEngine\x64\Release\AsmEngine.lib
