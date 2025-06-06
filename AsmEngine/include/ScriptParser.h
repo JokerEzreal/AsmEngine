@@ -93,6 +93,9 @@ namespace AsmEngine {
         std::string ProcessAnonymousLabels(const std::string& line);
         std::vector<uint8_t> ParseDataBytes(const std::vector<std::string>& args) const;
 
+        // General number parsing function
+        uint64_t ParseNumber(const std::string& str) const;
+
         // Command handlers
         void HandleAobscan(const ParsedCommand& cmd);
         void HandleAobscanmodule(const ParsedCommand& cmd);

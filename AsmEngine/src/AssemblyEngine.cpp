@@ -40,7 +40,51 @@ namespace AsmEngine {
 
         std::string result = line;
 
-        // Get all capture names
+        // 先处理内存引用中的十六进制数（如 [rax+30], [rdx-0C]）
+        std::regex memOffsetRegex(R"(\[([^\]]+)\])");
+        std::smatch memMatch;
+        std::string temp = result;
+
+        while (std::regex_search(temp, memMatch, memOffsetRegex)) {
+            std::string memExpr = memMatch[1].str();
+            std::string processedExpr = memExpr;
+
+            // 处理加减偏移
+            std::regex offsetRegex(R"(([+-])([0-9A-Fa-f]+)\b)");
+            std::smatch offsetMatch;
+            std::string tempExpr = processedExpr;
+            std::string newExpr;
+            size_t lastPos = 0;
+
+            while (std::regex_search(tempExpr, offsetMatch, offsetRegex)) {
+                // 添加匹配前的部分
+                newExpr += tempExpr.substr(0, offsetMatch.position());
+
+                std::string sign = offsetMatch[1].str();
+                std::string num = offsetMatch[2].str();
+
+                // 添加处理后的偏移（确保是0x格式）
+                newExpr += sign + "0x" + num;
+
+                // 移动到下一个搜索位置
+                lastPos = offsetMatch.position() + offsetMatch.length();
+                tempExpr = tempExpr.substr(lastPos);
+            }
+
+            // 添加剩余部分
+            newExpr += tempExpr;
+            processedExpr = newExpr;
+
+            // 替换原始表达式
+            size_t pos = result.find(memMatch[0].str());
+            if (pos != std::string::npos) {
+                result.replace(pos, memMatch[0].length(), "[" + processedExpr + "]");
+            }
+
+            temp = memMatch.suffix();
+        }
+
+        // 处理捕获引用
         auto captureNames = captureStorage_->GetAllNames();
 
         // Sort by length (descending) to replace longer names first
@@ -52,7 +96,6 @@ namespace AsmEngine {
         // Replace each capture reference
         for (const auto& captureName : captureNames) {
             // Create regex that matches the capture name as a whole word
-            // This handles cases like s1, s2 in assembly instructions
             std::regex captureRegex(R"(\b)" + captureName + R"(\b)");
 
             auto capture = captureStorage_->Get(captureName);

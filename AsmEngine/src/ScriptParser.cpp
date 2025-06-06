@@ -175,14 +175,25 @@ namespace AsmEngine {
             std::string baseName = labelPart.substr(0, plusPos);
             std::string offsetStr = labelPart.substr(plusPos + 1);
 
-            // Parse offset (can be hex or decimal)
+            // Parse offset - default to hex unless # prefix for decimal
             size_t offset = 0;
-            if (offsetStr.size() > 2 && offsetStr[0] == '0' &&
-                (offsetStr[1] == 'x' || offsetStr[1] == 'X')) {
-                offset = std::stoull(offsetStr, nullptr, 16);
+            try {
+                if (!offsetStr.empty() && offsetStr[0] == '#') {
+                    // Decimal with # prefix
+                    offset = std::stoull(offsetStr.substr(1), nullptr, 10);
+                }
+                else if (offsetStr.size() > 2 && offsetStr[0] == '0' &&
+                    (offsetStr[1] == 'x' || offsetStr[1] == 'X')) {
+                    // Hex with 0x prefix
+                    offset = std::stoull(offsetStr, nullptr, 16);
+                }
+                else {
+                    // Default to hex
+                    offset = std::stoull(offsetStr, nullptr, 16);
+                }
             }
-            else {
-                offset = std::stoull(offsetStr, nullptr, 10);
+            catch (...) {
+                offset = 0;
             }
 
             return { baseName, offset };
@@ -467,6 +478,48 @@ namespace AsmEngine {
         return data;
     }
 
+    uint64_t ScriptParser::ParseNumber(const std::string& str) const {
+        if (str.empty()) {
+            return 0;
+        }
+
+        std::string numStr = str;
+        bool negative = false;
+
+        // Handle negative numbers
+        if (str[0] == '-') {
+            negative = true;
+            numStr = str.substr(1);
+        }
+
+        uint64_t value = 0;
+
+        try {
+            if (!numStr.empty() && numStr[0] == '#') {
+                // Decimal with # prefix
+                value = std::stoull(numStr.substr(1), nullptr, 10);
+            }
+            else if (numStr.size() > 1 && numStr[0] == '$') {
+                // Hex with $ prefix (CE style)
+                value = std::stoull(numStr.substr(1), nullptr, 16);
+            }
+            else if (numStr.size() > 2 && numStr[0] == '0' &&
+                (numStr[1] == 'x' || numStr[1] == 'X')) {
+                // Hex with 0x prefix
+                value = std::stoull(numStr, nullptr, 16);
+            }
+            else {
+                // Default to hex (including cases like 0C, 30, etc.)
+                value = std::stoull(numStr, nullptr, 16);
+            }
+        }
+        catch (...) {
+            value = 0;
+        }
+
+        return negative ? static_cast<uint64_t>(-static_cast<int64_t>(value)) : value;
+    }
+
     void ScriptParser::Execute() {
         // Execute ENABLE section by default
         for (auto& section : sections_) {
@@ -715,13 +768,17 @@ namespace AsmEngine {
 
         std::string name = cmd.arguments[0];
 
-        // Parse size (can be decimal or hex)
+        // Parse size - default to hex unless # prefix for decimal
         size_t size = 0;
         std::string sizeStr = cmd.arguments[1];
 
         if (sizeStr.size() > 1 && sizeStr[0] == '$') {
-            // Hex with $ prefix
+            // Hex with $ prefix (CE style)
             size = std::stoull(sizeStr.substr(1), nullptr, 16);
+        }
+        else if (sizeStr.size() > 1 && sizeStr[0] == '#') {
+            // Decimal with # prefix
+            size = std::stoull(sizeStr.substr(1), nullptr, 10);
         }
         else if (sizeStr.size() > 2 && sizeStr[0] == '0' &&
             (sizeStr[1] == 'x' || sizeStr[1] == 'X')) {
@@ -729,8 +786,8 @@ namespace AsmEngine {
             size = std::stoull(sizeStr, nullptr, 16);
         }
         else {
-            // Decimal
-            size = std::stoull(sizeStr, nullptr, 10);
+            // Default to hex
+            size = std::stoull(sizeStr, nullptr, 16);
         }
 
         // Allocate near address if specified
@@ -847,28 +904,27 @@ namespace AsmEngine {
         std::vector<uint8_t> data;
 
         if (cmd.type == CommandType::Db) {
-            // Define bytes - handle captures
-            data = ParseDataBytes(cmd.arguments);
+            // Define bytes - handle captures and hex values
+            for (const auto& arg : cmd.arguments) {
+                if (engine_->Captures()->Exists(arg)) {
+                    auto capture = engine_->Captures()->Get(arg);
+                    if (capture) {
+                        for (uint8_t byte : capture->data) {
+                            data.push_back(byte);
+                        }
+                    }
+                }
+                else {
+                    // Use the common number parser
+                    uint64_t value = ParseNumber(arg);
+                    data.push_back(value & 0xFF);
+                }
+            }
         }
         else if (cmd.type == CommandType::Dd) {
             // Define dwords
             for (const auto& arg : cmd.arguments) {
-                uint32_t value = 0;
-                if (!arg.empty()) {
-                    try {
-                        if (arg.find("0x") == 0) {
-                            value = std::stoul(arg, nullptr, 16);
-                        }
-                        else {
-                            value = std::stoul(arg, nullptr, 10);
-                        }
-                    }
-                    catch (const std::exception& e) {
-                        // 如果转换失败，使用0
-                        value = 0;
-                    }
-                }
-
+                uint32_t value = static_cast<uint32_t>(ParseNumber(arg));
                 data.push_back(value & 0xFF);
                 data.push_back((value >> 8) & 0xFF);
                 data.push_back((value >> 16) & 0xFF);
@@ -878,22 +934,7 @@ namespace AsmEngine {
         else if (cmd.type == CommandType::Dq) {
             // Define qwords
             for (const auto& arg : cmd.arguments) {
-                uint64_t value = 0;
-                if (!arg.empty()) {
-                    try {
-                        if (arg.find("0x") == 0) {
-                            value = std::stoull(arg, nullptr, 16);
-                        }
-                        else {
-                            value = std::stoull(arg, nullptr, 10);
-                        }
-                    }
-                    catch (const std::exception& e) {
-                        // 如果转换失败，使用0
-                        value = 0;
-                    }
-                }
-
+                uint64_t value = ParseNumber(arg);
                 for (int i = 0; i < 8; i++) {
                     data.push_back((value >> (i * 8)) & 0xFF);
                 }
