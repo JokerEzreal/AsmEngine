@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Common.h"
+#include <map>
 
 namespace AsmEngine {
 
@@ -53,6 +54,15 @@ namespace AsmEngine {
         std::string name;
         std::vector<ParsedCommand> commands;
         bool isEnabled;
+
+        // Track memory allocations for this section
+        std::map<std::string, AddressType> allocations;
+
+        // Track assembled code
+        std::map<std::string, std::vector<uint8_t>> codeChunks;
+
+        // Track label positions
+        std::map<std::string, AddressType> labels;
     };
 
     class ScriptParser {
@@ -64,11 +74,24 @@ namespace AsmEngine {
         std::vector<ScriptSection> sections_;
         ScriptSection* currentSection_;
 
+        // For tracking anonymous labels
+        std::map<std::string, std::vector<size_t>> forwardJumps_;
+        std::map<std::string, AddressType> labelAddresses_;
+        int anonymousLabelCounter_;
+
         // Parse helpers
         ParsedCommand ParseLine(const std::string& line, size_t lineNumber) const;
         CommandType IdentifyCommand(const std::string& command) const;
         std::vector<std::string> TokenizeLine(const std::string& line) const;
         std::string ExpandDefines(const std::string& line) const;
+
+        // New helpers for CE script support
+        std::string PreprocessLine(const std::string& line) const;
+        bool IsLabel(const std::string& line) const;
+        std::pair<std::string, size_t> ParseLabelWithOffset(const std::string& line) const;
+        std::string ConvertFloatValue(const std::string& value) const;
+        std::string ProcessAnonymousLabels(const std::string& line);
+        std::vector<uint8_t> ParseDataBytes(const std::vector<std::string>& args) const;
 
         // Command handlers
         void HandleAobscan(const ParsedCommand& cmd);
@@ -81,10 +104,15 @@ namespace AsmEngine {
         void HandleAsm(const ParsedCommand& cmd);
         void HandleDefine(const ParsedCommand& cmd);
         void HandleInclude(const ParsedCommand& cmd);
+        void HandleDataDefinition(const ParsedCommand& cmd);
 
         // Section handlers
         void BeginSection(const std::string& name);
         void EndSection();
+
+        // Assembly helpers
+        AddressType GetCurrentAddress() const;
+        void WriteCodeToMemory();
 
     public:
         ScriptParser(AsmEngine* engine);

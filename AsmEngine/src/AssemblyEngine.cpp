@@ -40,17 +40,47 @@ namespace AsmEngine {
 
         std::string result = line;
 
-        // Regex to match capture references like s1, sr1, etc.
-        std::regex captureRegex(R"(\b([a-zA-Z]\w*)\b)");
-
         // Get all capture names
         auto captureNames = captureStorage_->GetAllNames();
 
+        // Sort by length (descending) to replace longer names first
+        std::sort(captureNames.begin(), captureNames.end(),
+            [](const std::string& a, const std::string& b) {
+                return a.length() > b.length();
+            });
+
         // Replace each capture reference
         for (const auto& captureName : captureNames) {
-            std::regex specificCapture(R"(\b)" + captureName + R"(\b)");
-            std::string replacement = captureStorage_->ResolveReference(captureName);
-            result = std::regex_replace(result, specificCapture, replacement);
+            // Create regex that matches the capture name as a whole word
+            // This handles cases like s1, s2 in assembly instructions
+            std::regex captureRegex(R"(\b)" + captureName + R"(\b)");
+
+            auto capture = captureStorage_->Get(captureName);
+            if (!capture) continue;
+
+            // Convert captured value to appropriate representation
+            std::string replacement;
+
+            switch (capture->size) {
+            case 1:
+                replacement = std::to_string(capture->AsUInt8());
+                break;
+            case 2:
+                replacement = std::to_string(capture->AsUInt16());
+                break;
+            case 4:
+                replacement = std::to_string(capture->AsUInt32());
+                break;
+            case 8:
+                replacement = std::to_string(capture->AsUInt64());
+                break;
+            default:
+                // For other sizes, use hex representation
+                replacement = "0x" + BytesToString(capture->data);
+                break;
+            }
+
+            result = std::regex_replace(result, captureRegex, replacement);
         }
 
         return result;
@@ -74,9 +104,19 @@ namespace AsmEngine {
 
         // Replace each symbol reference with its address
         for (const auto& symbol : symbols) {
-            // Skip if it's a label (will be handled by assembler)
+            // Skip if it's a label that might be used in jumps
             if (symbol.type == SymbolType::Label) {
-                continue;
+                // Only replace in certain contexts (not in jump instructions)
+                if (line.find("jmp") != std::string::npos ||
+                    line.find("call") != std::string::npos ||
+                    line.find("je") != std::string::npos ||
+                    line.find("jne") != std::string::npos ||
+                    line.find("jg") != std::string::npos ||
+                    line.find("jl") != std::string::npos ||
+                    line.find("ja") != std::string::npos ||
+                    line.find("jb") != std::string::npos) {
+                    continue;
+                }
             }
 
             std::regex symbolRegex(R"(\b)" + symbol.name + R"(\b)");
