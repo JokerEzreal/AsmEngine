@@ -242,6 +242,21 @@ namespace AsmEngine {
             throw EngineException(ErrorCode::InvalidParameter, "Empty command");
         }
 
+        // 特殊处理 "nop X" 语法
+        if (tokens.size() == 2 && tokens[0] == "nop") {
+            // 转换 "nop 3" 为多个nop指令
+            try {
+                int count = std::stoi(tokens[1]);
+                cmd.type = CommandType::Asm;
+                cmd.name = "nop_multiple";
+                cmd.arguments.push_back(std::to_string(count));
+                return cmd;
+            }
+            catch (...) {
+                // 如果不是数字，按普通汇编处理
+            }
+        }
+
         // First token is the command
         cmd.type = IdentifyCommand(tokens[0]);
         cmd.name = tokens[0];
@@ -558,19 +573,31 @@ namespace AsmEngine {
 
                 case CommandType::Asm:
                     if (!currentLabel.empty() && currentWriteAddress > 0) {
-                        // Assemble and add to current label's buffer
-                        std::string asmLine = cmd.name;
-                        for (const auto& arg : cmd.arguments) {
-                            asmLine += " " + arg;
-                        }
-
-                        auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentWriteAddress);
-                        if (result) {
+                        // 检查是否是多个nop
+                        if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
+                            int count = std::stoi(cmd.arguments[0]);
+                            std::vector<uint8_t> nops(count, 0x90); // 0x90 是 NOP 指令
                             currentSection_->codeChunks[currentLabel].insert(
                                 currentSection_->codeChunks[currentLabel].end(),
-                                result->begin(), result->end()
+                                nops.begin(), nops.end()
                             );
-                            currentWriteAddress += result->size();
+                            currentWriteAddress += count;
+                        }
+                        else {
+                            // 正常的汇编指令处理
+                            std::string asmLine = cmd.name;
+                            for (const auto& arg : cmd.arguments) {
+                                asmLine += " " + arg;
+                            }
+
+                            auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentWriteAddress);
+                            if (result) {
+                                currentSection_->codeChunks[currentLabel].insert(
+                                    currentSection_->codeChunks[currentLabel].end(),
+                                    result->begin(), result->end()
+                                );
+                                currentWriteAddress += result->size();
+                            }
                         }
                     }
                     break;
@@ -828,11 +855,17 @@ namespace AsmEngine {
             for (const auto& arg : cmd.arguments) {
                 uint32_t value = 0;
                 if (!arg.empty()) {
-                    if (arg.find("0x") == 0) {
-                        value = std::stoul(arg, nullptr, 16);
+                    try {
+                        if (arg.find("0x") == 0) {
+                            value = std::stoul(arg, nullptr, 16);
+                        }
+                        else {
+                            value = std::stoul(arg, nullptr, 10);
+                        }
                     }
-                    else {
-                        value = std::stoul(arg, nullptr, 10);
+                    catch (const std::exception& e) {
+                        // 如果转换失败，使用0
+                        value = 0;
                     }
                 }
 
@@ -847,11 +880,17 @@ namespace AsmEngine {
             for (const auto& arg : cmd.arguments) {
                 uint64_t value = 0;
                 if (!arg.empty()) {
-                    if (arg.find("0x") == 0) {
-                        value = std::stoull(arg, nullptr, 16);
+                    try {
+                        if (arg.find("0x") == 0) {
+                            value = std::stoull(arg, nullptr, 16);
+                        }
+                        else {
+                            value = std::stoull(arg, nullptr, 10);
+                        }
                     }
-                    else {
-                        value = std::stoull(arg, nullptr, 10);
+                    catch (const std::exception& e) {
+                        // 如果转换失败，使用0
+                        value = 0;
                     }
                 }
 
