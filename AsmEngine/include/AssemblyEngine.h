@@ -3,6 +3,8 @@
 #include "Common.h"
 #include "SymbolManager.h"
 #include "CaptureStorage.h"
+#include <asmjit/asmjit.h>
+#include <memory>
 
 namespace AsmEngine {
 
@@ -24,7 +26,7 @@ namespace AsmEngine {
 
     class AssemblyEngine {
     private:
-        ks_engine* ksEngine_;
+        std::unique_ptr<asmjit::JitRuntime> runtime_;
         SymbolManager* symbolManager_;
         CaptureStorage* captureStorage_;
 
@@ -41,6 +43,10 @@ namespace AsmEngine {
         // Extract labels from assembly
         std::vector<std::pair<std::string, size_t>> ExtractLabels(
             const std::string& assembly) const;
+
+        // Parse and assemble single instruction using AsmJit
+        std::optional<ByteVector> AssembleWithAsmJit(const std::string& instruction,
+            AddressType address = 0);
 
     public:
         AssemblyEngine(SymbolManager* symbolManager, CaptureStorage* captureStorage);

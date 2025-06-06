@@ -1,30 +1,23 @@
 ﻿#include "AssemblyEngine.h"
+#include "InstructionParser.h"
 #include <regex>
 #include <sstream>
+#include <asmjit/x86.h>
 
 namespace AsmEngine {
 
+    using namespace asmjit;
+
     AssemblyEngine::AssemblyEngine(SymbolManager* symbolManager,
         CaptureStorage* captureStorage)
-        : ksEngine_(nullptr), symbolManager_(symbolManager),
-        captureStorage_(captureStorage) {
+        : symbolManager_(symbolManager), captureStorage_(captureStorage) {
 
-        // Initialize Keystone for x64
-        ks_err err = ks_open(KS_ARCH_X86, KS_MODE_64, &ksEngine_);
-        if (err != KS_ERR_OK) {
-            throw EngineException(ErrorCode::AssemblyError,
-                "Failed to initialize Keystone engine: " +
-                std::string(ks_strerror(err)));
-        }
-
-        // Set syntax to NASM
-        ks_option(ksEngine_, KS_OPT_SYNTAX, KS_OPT_SYNTAX_NASM);
+        // Initialize AsmJit runtime
+        runtime_ = std::make_unique<JitRuntime>();
     }
 
     AssemblyEngine::~AssemblyEngine() {
-        if (ksEngine_) {
-            ks_close(ksEngine_);
-        }
+        // AsmJit cleanup is automatic
     }
 
     std::string AssemblyEngine::PreprocessAssembly(const std::string& assembly,
@@ -48,7 +41,6 @@ namespace AsmEngine {
         std::string result = line;
 
         // Regex to match capture references like s1, sr1, etc.
-        // Matches word boundaries to avoid replacing parts of other identifiers
         std::regex captureRegex(R"(\b([a-zA-Z]\w*)\b)");
 
         // Get all capture names
@@ -96,71 +88,80 @@ namespace AsmEngine {
         return result;
     }
 
-    std::vector<std::pair<std::string, size_t>> AssemblyEngine::ExtractLabels(
-        const std::string& assembly) const {
+    std::optional<ByteVector> AssemblyEngine::AssembleWithAsmJit(
+        const std::string& instruction, AddressType address) {
 
-        std::vector<std::pair<std::string, size_t>> labels;
-        std::istringstream stream(assembly);
+        CodeHolder code;
+        code.init(runtime_->environment());
+
+        x86::Assembler assembler(&code);
+
+        // Parse instruction using the new parser
+        auto parsed = InstructionParser::Parse(instruction);
+
+        try {
+            // Use the extended assembler for instruction handling
+            if (!ExtendedAssembler::AssembleInstruction(assembler, parsed)) {
+                return std::nullopt;
+            }
+
+        }
+        catch (...) {
+            return std::nullopt;
+        }
+
+        // Get the assembled code
+        CodeBuffer& buffer = code.sectionById(0)->buffer();
+        if (buffer.size() == 0) {
+            return std::nullopt;
+        }
+
+        ByteVector result(buffer.data(), buffer.data() + buffer.size());
+        return result;
+    }
+
+    std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly,
+        AddressType address) {
+
+        // Preprocess the assembly
+        std::string processed = PreprocessAssembly(assembly, address);
+
+        AssembledCode result;
+
+        // Split into lines and assemble each
+        std::istringstream stream(processed);
         std::string line;
-        size_t offset = 0;
 
         while (std::getline(stream, line)) {
             // Trim whitespace
             line.erase(0, line.find_first_not_of(" \t"));
             line.erase(line.find_last_not_of(" \t") + 1);
 
-            // Check if line is a label (ends with :)
-            if (!line.empty() && line.back() == ':') {
+            // Skip empty lines and comments
+            if (line.empty() || line[0] == ';') {
+                continue;
+            }
+
+            // Check for labels
+            if (line.back() == ':') {
                 std::string labelName = line.substr(0, line.length() - 1);
-                labels.emplace_back(labelName, offset);
+                result.labels[labelName] = address + result.machineCode.size();
+
+                if (symbolManager_) {
+                    symbolManager_->RegisterLabel(labelName, address + result.machineCode.size());
+                }
+                continue;
             }
-            else if (!line.empty() && line[0] != ';') {
-                // Estimate instruction size (rough approximation)
-                // In real implementation, we'd assemble each instruction
-                offset += 5; // Average x64 instruction size
-            }
-        }
 
-        return labels;
-    }
-
-    std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly,
-        AddressType address) {
-        // Preprocess the assembly
-        std::string processed = PreprocessAssembly(assembly, address);
-
-        // Extract labels before assembly
-        auto labels = ExtractLabels(processed);
-
-        // Assemble with Keystone
-        unsigned char* machineCode = nullptr;
-        size_t machineCodeSize = 0;
-        size_t statementCount = 0;
-
-        if (ks_asm(ksEngine_, processed.c_str(), address,
-            &machineCode, &machineCodeSize, &statementCount) != KS_ERR_OK) {
-            return std::nullopt;
-        }
-
-        // Create result
-        AssembledCode result;
-        result.machineCode.assign(machineCode, machineCode + machineCodeSize);
-        result.codeSize = machineCodeSize;
-
-        // Register labels with their addresses
-        for (const auto& [labelName, offset] : labels) {
-            AddressType labelAddress = address + offset;
-            result.labels[labelName] = labelAddress;
-
-            // Register in symbol manager if available
-            if (symbolManager_) {
-                symbolManager_->RegisterLabel(labelName, labelAddress);
+            // Assemble instruction
+            auto instructionBytes = AssembleWithAsmJit(line, address + result.machineCode.size());
+            if (instructionBytes) {
+                result.machineCode.insert(result.machineCode.end(),
+                    instructionBytes->begin(), instructionBytes->end());
             }
         }
 
-        // Free Keystone allocated memory
-        ks_free(machineCode);
-
+        result.codeSize = result.machineCode.size();
         return result;
     }
 
@@ -168,30 +169,16 @@ namespace AsmEngine {
         const std::string& instruction, AddressType address) {
 
         std::string processed = PreprocessAssembly(instruction, address);
-
-        unsigned char* machineCode = nullptr;
-        size_t machineCodeSize = 0;
-        size_t statementCount = 0;
-
-        if (ks_asm(ksEngine_, processed.c_str(), address,
-            &machineCode, &machineCodeSize, &statementCount) != KS_ERR_OK) {
-            return std::nullopt;
-        }
-
-        ByteVector result(machineCode, machineCode + machineCodeSize);
-        ks_free(machineCode);
-
-        return result;
+        return AssembleWithAsmJit(processed, address);
     }
 
     std::vector<AssemblyInstruction> AssemblyEngine::Disassemble(
         const ByteVector& machineCode, AddressType address) {
 
-        // Note: This would require a disassembler like Capstone
-        // For now, returning empty vector
+        // Note: For disassembly, you'd need to add a disassembler library like Zydis
         std::vector<AssemblyInstruction> instructions;
 
-        // TODO: Implement with Capstone disassembler
+        // TODO: Implement with Zydis disassembler
 
         return instructions;
     }
@@ -283,15 +270,8 @@ namespace AsmEngine {
 
     ByteVector AssemblyEngine::GenerateDetour(AddressType from, AddressType to,
         AddressType& trampolineSize) {
-        // This is a simplified detour generator
-        // In production, you'd need to:
-        // 1. Disassemble instructions at 'from' to find safe hook point
-        // 2. Copy original instructions to trampoline
-        // 3. Add jump back to original code
 
         ByteVector detour;
-
-        // For now, assume we need at least 5 bytes for jump
         trampolineSize = 5;
 
         // Generate jump to hook
@@ -305,12 +285,8 @@ namespace AsmEngine {
         return detour;
     }
 
-    // 在 AssemblyEngine.cpp 中修复 CreateHook 函数
-    std::optional<AssemblyEngine::HookInfo> AssemblyEngine::CreateHook(AddressType targetAddress,
-        const std::string& hookCode) {
-        // This is a simplified hook creator
-        // Full implementation would need memory allocation,
-        // proper trampoline generation, etc.
+    std::optional<AssemblyEngine::HookInfo> AssemblyEngine::CreateHook(
+        AddressType targetAddress, const std::string& hookCode) {
 
         HookInfo hook;
         hook.targetAddress = targetAddress;
@@ -331,15 +307,35 @@ namespace AsmEngine {
     std::optional<std::vector<uint64_t>> AssemblyEngine::ExecuteAssembly(
         const std::string& assembly, const std::vector<uint64_t>& parameters) {
 
-        // This would require:
-        // 1. Allocating executable memory
-        // 2. Writing assembled code
-        // 3. Setting up parameters
-        // 4. Executing code
-        // 5. Retrieving results
-
         // Not implemented for safety reasons
         return std::nullopt;
+    }
+
+    std::vector<std::pair<std::string, size_t>> AssemblyEngine::ExtractLabels(
+        const std::string& assembly) const {
+
+        std::vector<std::pair<std::string, size_t>> labels;
+        std::istringstream stream(assembly);
+        std::string line;
+        size_t offset = 0;
+
+        while (std::getline(stream, line)) {
+            // Trim whitespace
+            line.erase(0, line.find_first_not_of(" \t"));
+            line.erase(line.find_last_not_of(" \t") + 1);
+
+            // Check if line is a label (ends with :)
+            if (!line.empty() && line.back() == ':') {
+                std::string labelName = line.substr(0, line.length() - 1);
+                labels.emplace_back(labelName, offset);
+            }
+            else if (!line.empty() && line[0] != ';') {
+                // Estimate instruction size (rough approximation)
+                offset += 5; // Average x64 instruction size
+            }
+        }
+
+        return labels;
     }
 
 } // namespace AsmEngine

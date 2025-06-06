@@ -1,60 +1,51 @@
 #pragma once
 
-// ∑¿÷π Windows.h ∂®“Â min/max ∫Í
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
+// Windows headers
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <winternl.h>
 
-#include <Windows.h>
+// Standard library
+#include <cstdint>
 #include <vector>
 #include <string>
 #include <memory>
-#include <unordered_map>
-#include <mutex>
-#include <shared_mutex>
 #include <optional>
-#include <chrono>
-#include <cstdint>
-#include <algorithm>
+#include <unordered_map>
+#include <functional>
+#include <exception>
 #include <sstream>
 #include <iomanip>
+#include <chrono>
 #include <thread>
-#include <atomic>
-#include <functional>
+#include <mutex>
+#include <shared_mutex>
 
-// AVX2 intrinsics
+// SIMD support
 #include <immintrin.h>
-
-// Keystone assembler
-#include <keystone/keystone.h>
 
 namespace AsmEngine {
 
-    // Forward declarations
-    class AOBScanner;
-    class SymbolManager;
-    class MemoryManager;
-    class ScriptParser;
-    class AssemblyEngine;
-    class CaptureStorage;
-
-    // Common types
+    // Basic types
+    using AddressType = std::uintptr_t;
     using ByteVector = std::vector<uint8_t>;
-    using AddressType = uintptr_t;
 
-    // Error handling
+    // Error codes
     enum class ErrorCode {
         Success = 0,
-        InvalidPattern,
-        PatternNotFound,
+        InvalidParameter,
+        ProcessNotFound,
         MemoryAccessError,
+        PatternNotFound,
+        InvalidPattern,
         AssemblyError,
+        DisassemblyError,
         SymbolNotFound,
         AllocationError,
-        ProcessNotFound,
-        InvalidParameter
+        Unknown
     };
 
+    // Exception class
     class EngineException : public std::exception {
     private:
         ErrorCode code_;
@@ -65,62 +56,47 @@ namespace AsmEngine {
             : code_(code), message_(message) {
         }
 
-        const char* what() const noexcept override {
-            return message_.c_str();
-        }
-
         ErrorCode code() const { return code_; }
+        const char* what() const noexcept override { return message_.c_str(); }
     };
 
     // Utility functions
     inline std::string BytesToString(const ByteVector& bytes) {
         std::stringstream ss;
-        for (size_t i = 0; i < bytes.size(); ++i) {
-            if (i > 0) ss << " ";
-            ss << std::hex << std::setfill('0') << std::setw(2)
-                << static_cast<int>(bytes[i]);
+        for (uint8_t byte : bytes) {
+            ss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
         }
         return ss.str();
     }
 
     inline ByteVector StringToBytes(const std::string& str) {
         ByteVector bytes;
-        std::stringstream ss(str);
-        std::string byte;
-
-        while (ss >> byte) {
-            if (byte == "?" || byte == "??") {
-                bytes.push_back(0);
-            }
-            else {
-                bytes.push_back(static_cast<uint8_t>(std::stoi(byte, nullptr, 16)));
-            }
+        for (size_t i = 0; i < str.length(); i += 2) {
+            std::string byteString = str.substr(i, 2);
+            uint8_t byte = static_cast<uint8_t>(std::stoul(byteString, nullptr, 16));
+            bytes.push_back(byte);
         }
-
         return bytes;
     }
 
-    // Enable debug privileges for process access
+    // Enable debug privileges
     inline bool EnableDebugPrivilege() {
         HANDLE hToken;
-        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
-            return false;
+        TOKEN_PRIVILEGES tkp;
 
-        LUID luid;
-        if (!LookupPrivilegeValue(nullptr, SE_DEBUG_NAME, &luid)) {
-            CloseHandle(hToken);
+        if (!OpenProcessToken(GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
             return false;
         }
 
-        TOKEN_PRIVILEGES tp;
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &tkp.Privileges[0].Luid);
+        tkp.PrivilegeCount = 1;
+        tkp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
 
-        bool result = AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        AdjustTokenPrivileges(hToken, FALSE, &tkp, 0, NULL, NULL);
         CloseHandle(hToken);
 
-        return result && GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+        return GetLastError() == ERROR_SUCCESS;
     }
 
 } // namespace AsmEngine

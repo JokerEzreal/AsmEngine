@@ -24,6 +24,7 @@
     <ClInclude Include="include\AssemblyEngine.h" />
     <ClInclude Include="include\CaptureStorage.h" />
     <ClInclude Include="include\Common.h" />
+    <ClInclude Include="include\InstructionParser.h" />
     <ClInclude Include="include\MemoryManager.h" />
     <ClInclude Include="include\ScriptParser.h" />
     <ClInclude Include="include\SymbolManager.h" />
@@ -33,6 +34,7 @@
     <ClCompile Include="src\AsmEngine.cpp" />
     <ClCompile Include="src\AssemblyEngine.cpp" />
     <ClCompile Include="src\CaptureStorage.cpp" />
+    <ClCompile Include="src\InstructionParser.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\MemoryManager.cpp" />
     <ClCompile Include="src\ScriptParser.cpp" />
@@ -153,7 +155,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
       <LanguageStandard>stdcpp17</LanguageStandard>
-      <AdditionalIncludeDirectories>external\keystone\include;include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <Optimization>MaxSpeed</Optimization>
       <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
       <EnableEnhancedInstructionSet>AdvancedVectorExtensions2</EnableEnhancedInstructionSet>
@@ -167,8 +169,8 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
     <Lib>
-      <AdditionalLibraryDirectories>external\keystone\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
-      <AdditionalDependencies>keystone.lib;ntdll.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>ntdll.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Lib>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

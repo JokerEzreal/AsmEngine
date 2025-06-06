@@ -1,0 +1,9 @@
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\AOBScanner.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\AOBScanner.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\AsmEngine.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\AsmEngine.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\AssemblyEngine.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\AssemblyEngine.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\CaptureStorage.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\CaptureStorage.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\InstructionParser.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\InstructionParser.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\main.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\main.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\MemoryManager.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\MemoryManager.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\ScriptParser.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\ScriptParser.obj
+C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\src\SymbolManager.cpp;C:\Users\Administrator\Desktop\AsmEngine\AsmEngine\x64\Release\SymbolManager.obj

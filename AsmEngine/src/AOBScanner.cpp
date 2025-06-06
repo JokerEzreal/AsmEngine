@@ -126,7 +126,7 @@ namespace AsmEngine {
         alignas(32) uint8_t maskBytes[32] = { 0 };
 
         const auto& elements = pattern.GetElements();
-        size_t simdSize = std::min(size_t(32), elements.size());
+        size_t simdSize = min(size_t(32), elements.size());
 
         for (size_t i = 0; i < simdSize; ++i) {
             const auto& elem = elements[i];
@@ -221,7 +221,7 @@ namespace AsmEngine {
         AddressType currentAddress = startAddress;
 
         while (currentAddress < endAddress - patternLength) {
-            size_t bytesToRead = std::min(bufferSize,
+            size_t bytesToRead = min(bufferSize,
                 static_cast<size_t>(endAddress - currentAddress));
             SIZE_T bytesRead = 0;
 
