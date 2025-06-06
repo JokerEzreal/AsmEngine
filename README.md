@@ -11,7 +11,7 @@ AsmEngine is a powerful C++ library for runtime code manipulation on x64 Windows
 - **Module-specific Scanning**: Target specific modules or scan entire process memory
 
 ### 💻 Assembly Engine
-- **Keystone Integration**: Full x64 assembly support with NASM syntax
+- **AsmJit Integration**: Full x64 assembly support with dynamic code generation
 - **Symbol Resolution**: Automatic resolution of symbols and captured values
 - **Code Generation**: Helper functions for jumps, calls, detours, and hooks
 - **Label Support**: Define and reference labels within assembly code
@@ -96,7 +96,7 @@ dealloc(HealthHook)
 - Windows x64
 - Visual Studio 2019 or later (or compatible compiler)
 - CMake 3.16+
-- Keystone Engine
+- AsmJit (included as submodule)
 
 ### Build Steps
 
@@ -106,9 +106,10 @@ git clone https://github.com/yourusername/AsmEngine.git
 cd AsmEngine
 ```
 
-2. Download Keystone Engine:
-   - Get prebuilt binaries from https://www.keystone-engine.org/
-   - Extract to `external/keystone/`
+2. Initialize submodules:
+```bash
+git submodule update --init --recursive
+```
 
 3. Build with CMake:
 ```bash
@@ -185,6 +186,28 @@ std::vector<AsmEngine::BatchOperation> ops = {
 engine.ExecuteBatch(ops);
 ```
 
+### Assembly Features with AsmJit
+
+The assembly engine now uses AsmJit for robust x64 code generation:
+
+```cpp
+// Generate code dynamically
+auto code = engine.Assembly()->Assemble(R"(
+    push rbx
+    mov rbx, [rcx+0x10]
+    test rbx, rbx
+    jz skip
+    mov rax, [rbx+0x20]
+    add rax, 100
+skip:
+    pop rbx
+    ret
+)", baseAddress);
+
+// Create detours with proper relocations
+engine.CreateDetour("TargetFunction", detourCode);
+```
+
 ## Performance Tips
 
 1. **Use SIMD Scanner**: Patterns ≥32 bytes automatically use AVX2 acceleration
@@ -192,6 +215,12 @@ engine.ExecuteBatch(ops);
 3. **Batch Operations**: Group multiple operations for better performance
 4. **Symbol Caching**: Enable symbol persistence to avoid re-scanning
 5. **Proximity Allocation**: Use AllocateNear() for jump targets
+
+## Dependencies
+
+- **AsmJit**: For x64 assembly and code generation
+- **Windows SDK**: For process manipulation APIs
+- **C++17**: For modern C++ features
 
 ## License
 
@@ -203,7 +232,7 @@ Contributions are welcome! Please feel free to submit pull requests or open issu
 
 ## Acknowledgments
 
-- Keystone Engine for assembly support
+- AsmJit for excellent JIT assembly support
 - Cheat Engine for inspiration and syntax compatibility
 - The reverse engineering community
 
