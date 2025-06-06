@@ -134,6 +134,14 @@ namespace AsmEngine {
 
         // Quick read
         std::optional<ByteVector> Read(DWORD processId, AddressType address, size_t size);
+
+        bool ExecuteCEScript(const std::string& processName, const std::string& script);
+        bool ExecuteCEScript(DWORD processId, const std::string& script);
     }
 
 } // namespace AsmEngine
+
+// Global convenience function for CE script execution
+inline bool ExecuteCEScript(const std::string& processName, const std::string& script) {
+    return AsmEngine::Quick::ExecuteCEScript(processName, script);
+}

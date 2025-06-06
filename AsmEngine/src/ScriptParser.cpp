@@ -285,33 +285,75 @@ namespace AsmEngine {
         std::vector<std::string> tokens;
         std::string processedLine = line;
 
-        // Fix parentheses for common commands
-        const std::vector<std::string> commands = {
-            "alloc(", "aobscanmodule(", "dealloc(", "registersymbol(", "unregistersymbol("
-        };
+        // Handle parentheses syntax for commands
+        std::regex cmdWithParens(R"(^(\w+)\s*\((.*)\)\s*$)");
+        std::smatch match;
 
-        for (const auto& cmd : commands) {
-            size_t pos = processedLine.find(cmd);
-            if (pos != std::string::npos) {
-                // Replace '(' with space
-                processedLine[pos + cmd.length() - 1] = ' ';
+        if (std::regex_match(processedLine, match, cmdWithParens)) {
+            // Command with parentheses
+            tokens.push_back(match[1].str()); // Command name
 
-                // Remove closing ')'
-                size_t closePos = processedLine.find(')', pos);
-                if (closePos != std::string::npos) {
-                    processedLine.erase(closePos, 1);
+            // Parse arguments inside parentheses
+            std::string args = match[2].str();
+            std::string current;
+            bool inQuotes = false;
+            int parenDepth = 0;
+
+            for (char c : args) {
+                if (c == '"' && (current.empty() || current.back() != '\\')) {
+                    inQuotes = !inQuotes;
+                    current += c;
+                }
+                else if (!inQuotes) {
+                    if (c == '(') {
+                        parenDepth++;
+                        current += c;
+                    }
+                    else if (c == ')') {
+                        parenDepth--;
+                        current += c;
+                    }
+                    else if (c == ',' && parenDepth == 0) {
+                        // Trim whitespace from current token
+                        current.erase(0, current.find_first_not_of(" \t"));
+                        current.erase(current.find_last_not_of(" \t") + 1);
+                        if (!current.empty()) {
+                            tokens.push_back(current);
+                            current.clear();
+                        }
+                    }
+                    else {
+                        current += c;
+                    }
+                }
+                else {
+                    current += c;
                 }
             }
+
+            // Add last token
+            current.erase(0, current.find_first_not_of(" \t"));
+            current.erase(current.find_last_not_of(" \t") + 1);
+            if (!current.empty()) {
+                tokens.push_back(current);
+            }
+
+            return tokens;
         }
 
-        // Handle multiple arguments in registersymbol/unregistersymbol
-        if (processedLine.find("registersymbol") != std::string::npos ||
-            processedLine.find("unregistersymbol") != std::string::npos) {
-            // These can have multiple space-separated arguments
+        // Handle registersymbol/unregistersymbol with multiple arguments
+        if (processedLine.find("registersymbol") == 0 || processedLine.find("unregistersymbol") == 0) {
             std::istringstream iss(processedLine);
             std::string token;
 
             while (iss >> token) {
+                // Remove parentheses if present
+                if (!token.empty() && token.front() == '(') {
+                    token = token.substr(1);
+                }
+                if (!token.empty() && token.back() == ')') {
+                    token = token.substr(0, token.length() - 1);
+                }
                 tokens.push_back(token);
             }
 
@@ -370,6 +412,44 @@ namespace AsmEngine {
         }
 
         return result;
+    }
+
+    std::vector<uint8_t> ScriptParser::ParseDataBytes(const std::vector<std::string>& args) const {
+        std::vector<uint8_t> data;
+
+        for (const auto& arg : args) {
+            // Check if it's a captured value
+            if (engine_->Captures()->Exists(arg)) {
+                auto capture = engine_->Captures()->Get(arg);
+                if (capture && capture->size == 1) {
+                    data.push_back(capture->AsUInt8());
+                }
+                else if (capture) {
+                    // For multi-byte captures in db, push each byte
+                    for (uint8_t byte : capture->data) {
+                        data.push_back(byte);
+                    }
+                }
+            }
+            else {
+                // Parse as hex or decimal byte
+                try {
+                    uint32_t value = 0;
+                    if (arg.size() > 2 && arg[0] == '0' && (arg[1] == 'x' || arg[1] == 'X')) {
+                        value = std::stoul(arg, nullptr, 16);
+                    }
+                    else {
+                        value = std::stoul(arg, nullptr, 16); // Default to hex for db
+                    }
+                    data.push_back(value & 0xFF);
+                }
+                catch (...) {
+                    // Skip invalid values
+                }
+            }
+        }
+
+        return data;
     }
 
     void ScriptParser::Execute() {
@@ -431,6 +511,7 @@ namespace AsmEngine {
         // Second pass: handle labels and assembly
         std::map<std::string, std::vector<uint8_t>> codeBuffers;
         std::string currentLabel;
+        AddressType currentWriteAddress = 0;
 
         for (const auto& cmd : sectionIt->commands) {
             try {
@@ -440,28 +521,75 @@ namespace AsmEngine {
                     if (cmd.arguments.size() > 1) {
                         // Label with offset
                         size_t offset = std::stoull(cmd.arguments[1]);
-                        // Create a new label at base + offset
-                        auto baseAddr = currentSection_->labels[currentLabel];
-                        if (baseAddr == 0 && currentSection_->allocations.count(currentLabel)) {
+
+                        // Find base address
+                        AddressType baseAddr = 0;
+                        if (currentSection_->allocations.count(currentLabel)) {
                             baseAddr = currentSection_->allocations[currentLabel];
                         }
-                        currentLabel = currentLabel + "_" + std::to_string(offset);
-                        currentSection_->labels[currentLabel] = baseAddr + offset;
+                        else if (currentSection_->labels.count(currentLabel)) {
+                            baseAddr = currentSection_->labels[currentLabel];
+                        }
+
+                        if (baseAddr > 0) {
+                            currentWriteAddress = baseAddr + offset;
+                            // Create unique label for this offset
+                            std::string offsetLabel = currentLabel + "_offset_" + std::to_string(offset);
+                            currentSection_->labels[offsetLabel] = currentWriteAddress;
+                            engine_->Symbols()->RegisterLabel(offsetLabel, currentWriteAddress);
+                            currentLabel = offsetLabel;
+                        }
+                    }
+                    else {
+                        // Regular label - find its address
+                        if (currentSection_->allocations.count(currentLabel)) {
+                            currentWriteAddress = currentSection_->allocations[currentLabel];
+                        }
+                        else if (currentSection_->labels.count(currentLabel)) {
+                            currentWriteAddress = currentSection_->labels[currentLabel];
+                        }
+
+                        if (currentWriteAddress > 0) {
+                            currentSection_->labels[currentLabel] = currentWriteAddress;
+                            engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
+                        }
                     }
                     break;
 
                 case CommandType::Asm:
-                    if (!currentLabel.empty()) {
+                    if (!currentLabel.empty() && currentWriteAddress > 0) {
                         // Assemble and add to current label's buffer
-                        HandleAsm(cmd);
+                        std::string asmLine = cmd.name;
+                        for (const auto& arg : cmd.arguments) {
+                            asmLine += " " + arg;
+                        }
+
+                        auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentWriteAddress);
+                        if (result) {
+                            currentSection_->codeChunks[currentLabel].insert(
+                                currentSection_->codeChunks[currentLabel].end(),
+                                result->begin(), result->end()
+                            );
+                            currentWriteAddress += result->size();
+                        }
                     }
                     break;
 
                 case CommandType::Db:
                 case CommandType::Dd:
                 case CommandType::Dq:
-                    if (!currentLabel.empty()) {
+                    if (!currentLabel.empty() && currentWriteAddress > 0) {
                         HandleDataDefinition(cmd);
+                        // Update write address based on data size
+                        if (cmd.type == CommandType::Db) {
+                            currentWriteAddress += cmd.arguments.size();
+                        }
+                        else if (cmd.type == CommandType::Dd) {
+                            currentWriteAddress += cmd.arguments.size() * 4;
+                        }
+                        else if (cmd.type == CommandType::Dq) {
+                            currentWriteAddress += cmd.arguments.size() * 8;
+                        }
                     }
                     break;
 
@@ -497,7 +625,13 @@ namespace AsmEngine {
         }
 
         std::string name = cmd.arguments[0];
-        std::string pattern = cmd.arguments[1];
+        std::string pattern;
+
+        // Combine all remaining arguments as pattern
+        for (size_t i = 1; i < cmd.arguments.size(); ++i) {
+            if (i > 1) pattern += " ";
+            pattern += cmd.arguments[i];
+        }
 
         // Scan all modules
         auto results = engine_->Scanner()->ScanAll(pattern);
@@ -537,6 +671,7 @@ namespace AsmEngine {
             engine_->Symbols()->RegisterSymbol(name, result->address);
             if (currentSection_) {
                 currentSection_->allocations[name] = result->address;
+                currentSection_->labels[name] = result->address;
             }
         }
         else {
@@ -623,24 +758,7 @@ namespace AsmEngine {
     }
 
     void ScriptParser::HandleLabel(const ParsedCommand& cmd) {
-        if (cmd.arguments.empty()) {
-            throw EngineException(ErrorCode::InvalidParameter,
-                "label requires name");
-        }
-
-        std::string labelName = cmd.arguments[0];
-
-        // If it's a label with offset, we handle it in ExecuteSection
-        if (cmd.arguments.size() > 1) {
-            return;
-        }
-
-        // Register label at current position
-        if (currentSection_) {
-            AddressType currentAddr = GetCurrentAddress();
-            currentSection_->labels[labelName] = currentAddr;
-            engine_->Symbols()->RegisterLabel(labelName, currentAddr);
-        }
+        // Label handling is done in ExecuteSection
     }
 
     void ScriptParser::HandleRegisterSymbol(const ParsedCommand& cmd) {
@@ -695,67 +813,18 @@ namespace AsmEngine {
     }
 
     void ScriptParser::HandleAsm(const ParsedCommand& cmd) {
-        // Reconstruct the assembly line
-        std::string asmLine = cmd.name;
-        for (const auto& arg : cmd.arguments) {
-            asmLine += " " + arg;
-        }
-
-        // Get current address
-        AddressType currentAddress = GetCurrentAddress();
-
-        // Assemble the instruction
-        auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentAddress);
-
-        if (!result) {
-            throw EngineException(ErrorCode::AssemblyError,
-                "Failed to assemble: " + asmLine);
-        }
-
-        // Store assembled code
-        if (currentSection_) {
-            // Find which allocation/label we're writing to
-            std::string targetLabel;
-            AddressType targetBase = 0;
-
-            for (const auto& [label, addr] : currentSection_->labels) {
-                if (addr <= currentAddress && addr > targetBase) {
-                    targetBase = addr;
-                    targetLabel = label;
-                }
-            }
-
-            if (!targetLabel.empty()) {
-                currentSection_->codeChunks[targetLabel].insert(
-                    currentSection_->codeChunks[targetLabel].end(),
-                    result->begin(), result->end()
-                );
-            }
-        }
+        // Assembly handling is done in ExecuteSection
     }
 
     void ScriptParser::HandleDataDefinition(const ParsedCommand& cmd) {
         std::vector<uint8_t> data;
 
         if (cmd.type == CommandType::Db) {
-            // Define bytes
-            for (const auto& arg : cmd.arguments) {
-                // Check if it's a captured value
-                if (engine_->Captures()->Exists(arg)) {
-                    auto capture = engine_->Captures()->Get(arg);
-                    if (capture) {
-                        data.insert(data.end(), capture->data.begin(), capture->data.end());
-                    }
-                }
-                else {
-                    // Parse as hex byte
-                    uint8_t byte = std::stoul(arg, nullptr, 16);
-                    data.push_back(byte);
-                }
-            }
+            // Define bytes - handle captures
+            data = ParseDataBytes(cmd.arguments);
         }
         else if (cmd.type == CommandType::Dd) {
-            // Define dword
+            // Define dwords
             for (const auto& arg : cmd.arguments) {
                 uint32_t value = 0;
                 if (!arg.empty()) {
@@ -774,7 +843,7 @@ namespace AsmEngine {
             }
         }
         else if (cmd.type == CommandType::Dq) {
-            // Define qword
+            // Define qwords
             for (const auto& arg : cmd.arguments) {
                 uint64_t value = 0;
                 if (!arg.empty()) {
@@ -796,10 +865,13 @@ namespace AsmEngine {
         if (currentSection_ && !data.empty()) {
             // Find current label
             std::string targetLabel;
+            AddressType targetAddr = 0;
+
+            // Find the most recent label
             for (const auto& [label, addr] : currentSection_->labels) {
-                if (addr == GetCurrentAddress()) {
+                if (addr <= GetCurrentAddress() && addr > targetAddr) {
+                    targetAddr = addr;
                     targetLabel = label;
-                    break;
                 }
             }
 
@@ -888,8 +960,8 @@ namespace AsmEngine {
             return 0;
         }
 
-        // Find the current write position
-        // This is simplified - in a real implementation you'd track this more carefully
+        // For now, return the first allocation address
+        // In a real implementation, you'd track the current write position more carefully
         if (!currentSection_->allocations.empty()) {
             return currentSection_->allocations.begin()->second;
         }
@@ -917,7 +989,11 @@ namespace AsmEngine {
             }
 
             if (baseAddr) {
-                engine_->Memory()->WriteMemory(baseAddr, code.data(), code.size());
+                // Write the code
+                if (!engine_->Memory()->WriteMemory(baseAddr, code.data(), code.size())) {
+                    throw EngineException(ErrorCode::MemoryAccessError,
+                        "Failed to write code for label: " + label);
+                }
             }
         }
     }

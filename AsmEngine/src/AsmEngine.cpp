@@ -460,6 +460,40 @@ namespace AsmEngine {
             return std::nullopt;
         }
 
+        bool ExecuteCEScript(const std::string& processName, const std::string& script) {
+            try {
+                AsmEngine engine;
+
+                // Attach to process
+                if (!engine.AttachToProcess(processName)) {
+                    return false;
+                }
+
+                // Execute script
+                return engine.ExecuteScript(script);
+            }
+            catch (...) {
+                return false;
+            }
+        }
+
+        bool ExecuteCEScript(DWORD processId, const std::string& script) {
+            try {
+                AsmEngine engine;
+
+                // Attach to process
+                if (!engine.AttachToProcess(processId)) {
+                    return false;
+                }
+
+                // Execute script
+                return engine.ExecuteScript(script);
+            }
+            catch (...) {
+                return false;
+            }
+        }
+
     } // namespace Quick
 
 } // namespace AsmEngine
