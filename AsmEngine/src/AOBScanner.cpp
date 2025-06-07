@@ -1,7 +1,7 @@
 ﻿#include "AOBScanner.h"
 #include <Psapi.h>
 #include <regex>
-
+#include <iostream>
 namespace AsmEngine {
 
     // ParsedPattern methods
@@ -186,9 +186,19 @@ namespace AsmEngine {
 
     void AOBScanner::ExtractCaptures(const uint8_t* memory, const ParsedPattern& pattern,
         std::unordered_map<std::string, ByteVector>& captures) const {
+
         for (const auto& capture : pattern.GetCaptures()) {
             ByteVector data(capture.size);
             std::memcpy(data.data(), memory + capture.offset, capture.size);
+
+            // 调试输出
+            std::cout << "[DEBUG] Capture '" << capture.name << "' at offset "
+                << capture.offset << ", size " << capture.size << ": ";
+            for (uint8_t b : data) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)b << " ";
+            }
+            std::cout << std::dec << std::endl;
+
             captures[capture.name] = std::move(data);
         }
     }
@@ -243,9 +253,31 @@ namespace AsmEngine {
                     result.address = currentAddress + i;
                     result.captures = std::move(captures);
 
+                    // 调试输出 - 显示匹配位置周围的字节
+                    std::cout << "[DEBUG] Pattern matched at 0x" << std::hex << result.address << std::endl;
+                    std::cout << "[DEBUG] Bytes around match:" << std::endl;
+
+                    // 显示匹配位置前后的字节
+                    size_t contextStart = (i >= 16) ? i - 16 : 0;
+                    size_t contextEnd = min(i + patternLength + 16, bytesRead);
+
+                    for (size_t j = contextStart; j < contextEnd; ++j) {
+                        if (j == i) std::cout << "[";
+                        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                            << (int)buffer[j] << " ";
+                        if (j == i + patternLength - 1) std::cout << "]";
+                    }
+                    std::cout << std::dec << std::endl;
+
                     // Store captures if storage is available
                     if (captureStorage_) {
                         for (const auto& [name, data] : result.captures) {
+                            std::cout << "[DEBUG] Storing capture '" << name << "': ";
+                            for (uint8_t b : data) {
+                                std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)b << " ";
+                            }
+                            std::cout << std::dec << std::endl;
+
                             captureStorage_->Store(name, data, result.address, data.size());
                         }
                     }

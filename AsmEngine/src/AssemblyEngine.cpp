@@ -3,6 +3,7 @@
 #include <regex>
 #include <sstream>
 #include <asmjit/x86.h>
+#include <iostream>
 
 namespace AsmEngine {
 
@@ -39,6 +40,13 @@ namespace AsmEngine {
         }
 
         std::string result = line;
+        auto captureNames = captureStorage_->GetAllNames();
+
+        // 调试输出
+        if (!captureNames.empty() && (line.find("s1") != std::string::npos ||
+            line.find("s2") != std::string::npos)) {
+            std::cout << "[DEBUG] ReplaceCaptureReferences: input = '" << line << "'" << std::endl;
+        }
 
         // 先处理内存引用中的十六进制数（如 [rax+30], [rdx-0C]）
         std::regex memOffsetRegex(R"(\[([^\]]+)\])");
@@ -84,9 +92,6 @@ namespace AsmEngine {
             temp = memMatch.suffix();
         }
 
-        // 处理捕获引用
-        auto captureNames = captureStorage_->GetAllNames();
-
         // Sort by length (descending) to replace longer names first
         std::sort(captureNames.begin(), captureNames.end(),
             [](const std::string& a, const std::string& b) {
@@ -125,7 +130,9 @@ namespace AsmEngine {
 
             result = std::regex_replace(result, captureRegex, replacement);
         }
-
+        if (!captureNames.empty() && result != line) {
+            std::cout << "[DEBUG] ReplaceCaptureReferences: output = '" << result << "'" << std::endl;
+        }
         return result;
     }
 
