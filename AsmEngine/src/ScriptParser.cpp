@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
+#include <iostream>
 
 namespace AsmEngine {
 
@@ -1051,29 +1052,90 @@ namespace AsmEngine {
 
     void ScriptParser::WriteCodeToMemory() {
         if (!currentSection_) {
+            std::cout << "[ERROR] No current section in WriteCodeToMemory" << std::endl;
             return;
         }
 
+        std::cout << "[DEBUG] WriteCodeToMemory: " << currentSection_->codeChunks.size()
+            << " code chunks to write" << std::endl;
+
         // Write each code chunk to its corresponding address
         for (const auto& [label, code] : currentSection_->codeChunks) {
-            if (code.empty()) continue;
+            if (code.empty()) {
+                std::cout << "[DEBUG] Skipping empty code chunk for label: " << label << std::endl;
+                continue;
+            }
 
             AddressType baseAddr = 0;
 
             // Find base address for this label
             if (currentSection_->labels.count(label)) {
                 baseAddr = currentSection_->labels[label];
+                std::cout << "[DEBUG] Found label '" << label << "' in section labels: 0x"
+                    << std::hex << baseAddr << std::dec << std::endl;
             }
             else if (currentSection_->allocations.count(label)) {
                 baseAddr = currentSection_->allocations[label];
+                std::cout << "[DEBUG] Found label '" << label << "' in allocations: 0x"
+                    << std::hex << baseAddr << std::dec << std::endl;
+            }
+            else {
+                // 尝试从符号管理器解析
+                auto resolved = engine_->Symbols()->ResolveAddress(label);
+                if (resolved) {
+                    baseAddr = *resolved;
+                    std::cout << "[DEBUG] Resolved label '" << label << "' from symbols: 0x"
+                        << std::hex << baseAddr << std::dec << std::endl;
+                }
             }
 
             if (baseAddr) {
+                std::cout << "[DEBUG] Writing " << code.size() << " bytes to 0x"
+                    << std::hex << baseAddr << " for label '" << label << "': ";
+
+                // 显示前几个字节
+                for (size_t i = 0; i < std::min<size_t>(code.size(), 16); ++i) {
+                    std::cout << std::hex << std::setw(2) << std::setfill('0')
+                        << (int)code[i] << " ";
+                }
+                if (code.size() > 16) {
+                    std::cout << "...";
+                }
+                std::cout << std::dec << std::endl;
+
                 // Write the code
                 if (!engine_->Memory()->WriteMemory(baseAddr, code.data(), code.size())) {
+                    DWORD error = GetLastError();
                     throw EngineException(ErrorCode::MemoryAccessError,
-                        "Failed to write code for label: " + label);
+                        "Failed to write code for label: " + label +
+                        " at 0x" + std::to_string(baseAddr) +
+                        ", Windows error: " + std::to_string(error));
                 }
+                else {
+                    std::cout << "[DEBUG] Successfully wrote code for label: " << label << std::endl;
+
+                    // 验证写入
+                    std::vector<uint8_t> verify(code.size());
+                    if (engine_->Memory()->ReadMemory(baseAddr, verify.data(), verify.size())) {
+                        bool match = true;
+                        for (size_t i = 0; i < code.size(); ++i) {
+                            if (verify[i] != code[i]) {
+                                match = false;
+                                break;
+                            }
+                        }
+
+                        if (match) {
+                            std::cout << "[DEBUG] Write verification successful" << std::endl;
+                        }
+                        else {
+                            std::cout << "[ERROR] Write verification failed - data mismatch!" << std::endl;
+                        }
+                    }
+                }
+            }
+            else {
+                std::cout << "[ERROR] No base address found for label: " << label << std::endl;
             }
         }
     }
