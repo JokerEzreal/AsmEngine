@@ -21,17 +21,59 @@ namespace AsmEngine {
         // AsmJit cleanup is automatic
     }
 
+    std::string AssemblyEngine::FixMemoryExpression(const std::string& expr) const {
+        std::string fixed = expr;
+
+        // 匹配 reg+number 或 reg-number 模式
+        std::regex offsetRegex(R"(([a-zA-Z]+[0-9]*)([+-])([0-9A-Fa-f]+))");
+        std::smatch match;
+
+        if (std::regex_match(expr, match, offsetRegex)) {
+            std::string reg = match[1].str();
+            std::string sign = match[2].str();
+            std::string offset = match[3].str();
+
+            // 确保偏移量有0x前缀
+            if (offset.substr(0, 2) != "0x" && offset.substr(0, 2) != "0X") {
+                offset = "0x" + offset;
+            }
+
+            fixed = reg + sign + offset;
+        }
+
+        return fixed;
+    }
+
     std::string AssemblyEngine::PreprocessAssembly(const std::string& assembly,
         AddressType baseAddress) const {
         std::string processed = assembly;
 
-        // Replace capture references
+        // 替换捕获引用
         processed = ReplaceCaptureReferences(processed);
 
-        // Replace symbol references
+        // 替换符号引用
         processed = ReplaceSymbolReferences(processed);
 
-        return processed;
+        // 修复方括号内的语法
+        // 将 [reg+hex] 转换为 [reg+0xhex]
+        std::regex bracketRegex(R"(\[([^]]+)\])");
+        std::smatch match;
+        std::string temp = processed;
+        std::string result;
+
+        while (std::regex_search(temp, match, bracketRegex)) {
+            result += temp.substr(0, match.position());
+
+            std::string memExpr = match[1].str();
+            // 处理内存表达式
+            std::string fixedExpr = FixMemoryExpression(memExpr);
+            result += "[" + fixedExpr + "]";
+
+            temp = match.suffix();
+        }
+        result += temp;
+
+        return result;
     }
 
     std::string AssemblyEngine::ReplaceCaptureReferences(const std::string& line) const {
@@ -287,35 +329,35 @@ namespace AsmEngine {
     ByteVector AssemblyEngine::GenerateJump(AddressType from, AddressType to) {
         ByteVector jump;
 
-        // Calculate relative offset
+        // 计算相对偏移
         int64_t offset = static_cast<int64_t>(to) - static_cast<int64_t>(from) - 5;
 
-        // Check if we can use a short jump (32-bit offset)
+        std::cout << "[DEBUG] Generating jump from 0x" << std::hex << from
+            << " to 0x" << to << std::dec << std::endl;
+        std::cout << "[DEBUG] Jump offset: 0x" << std::hex << offset << std::dec << std::endl;
+
+        // 检查是否可以使用短跳转（32位偏移）
         if (offset >= INT32_MIN && offset <= INT32_MAX) {
-            // JMP rel32
+            // E9 rel32
             jump.push_back(0xE9);
 
-            // Add offset (little endian)
+            // 添加偏移（小端序）
             int32_t offset32 = static_cast<int32_t>(offset);
             jump.push_back(offset32 & 0xFF);
             jump.push_back((offset32 >> 8) & 0xFF);
             jump.push_back((offset32 >> 16) & 0xFF);
             jump.push_back((offset32 >> 24) & 0xFF);
+
+            std::cout << "[DEBUG] Generated E9 relative jump: ";
+            for (uint8_t b : jump) {
+                std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)b << " ";
+            }
+            std::cout << std::dec << std::endl;
         }
         else {
-            // Need absolute jump (14 bytes)
-            // MOV RAX, address
-            jump.push_back(0x48);
-            jump.push_back(0xB8);
-
-            // Add address (little endian)
-            for (int i = 0; i < 8; ++i) {
-                jump.push_back((to >> (i * 8)) & 0xFF);
-            }
-
-            // JMP RAX
-            jump.push_back(0xFF);
-            jump.push_back(0xE0);
+            std::cout << "[WARNING] Offset too large for relative jump, need trampoline" << std::endl;
+            // 这里应该使用跳板机制
+            return ByteVector(); // 返回空，让调用者处理
         }
 
         return jump;

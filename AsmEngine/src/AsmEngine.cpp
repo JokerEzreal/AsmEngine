@@ -34,6 +34,8 @@ namespace AsmEngine {
         assemblyEngine_ = std::make_unique<AssemblyEngine>(symbolManager_.get(),
             captureStorage_.get());
         scriptParser_ = std::make_unique<ScriptParser>(this);
+        trampolineManager_ = std::make_unique<TrampolineManager>(memoryManager_.get());
+        trampolineManager_->Initialize(1024); // 支持1024个跳板
 
         // Load persisted symbols if enabled
         if (config_.enableSymbolPersistence && !config_.symbolPersistenceFile.empty()) {

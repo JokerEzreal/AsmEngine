@@ -253,21 +253,29 @@ namespace AsmEngine {
                     result.address = currentAddress + i;
                     result.captures = std::move(captures);
 
-                    // 调试输出 - 显示匹配位置周围的字节
+                    // 详细调试输出
                     std::cout << "[DEBUG] Pattern matched at 0x" << std::hex << result.address << std::endl;
-                    std::cout << "[DEBUG] Bytes around match:" << std::endl;
 
-                    // 显示匹配位置前后的字节
-                    size_t contextStart = (i >= 16) ? i - 16 : 0;
-                    size_t contextEnd = min(i + patternLength + 16, bytesRead);
+                    // 显示pattern各部分的实际位置
+                    const auto& elements = parsed.GetElements();
+                    std::cout << "[DEBUG] Pattern structure:" << std::endl;
+                    for (size_t j = 0; j < elements.size(); ++j) {
+                        if (elements[j].type == PatternElementType::Capture) {
+                            std::cout << "  Offset " << j << ": Capture '"
+                                << elements[j].capture.name << "'" << std::endl;
 
-                    for (size_t j = contextStart; j < contextEnd; ++j) {
-                        if (j == i) std::cout << "[";
-                        std::cout << std::hex << std::setw(2) << std::setfill('0')
-                            << (int)buffer[j] << " ";
-                        if (j == i + patternLength - 1) std::cout << "]";
+                            // 显示实际捕获的字节
+                            if (j + 1 < patternLength) {
+                                std::cout << "    Next bytes: ";
+                                for (size_t k = j; k < min(j + 8, patternLength); ++k) {
+                                    std::cout << std::hex << std::setw(2) << std::setfill('0')
+                                        << (int)buffer[i + k] << " ";
+                                }
+                                std::cout << std::endl;
+                            }
+                        }
                     }
-                    std::cout << std::dec << std::endl;
+
 
                     // Store captures if storage is available
                     if (captureStorage_) {

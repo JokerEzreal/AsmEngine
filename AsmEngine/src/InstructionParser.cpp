@@ -125,34 +125,55 @@ namespace AsmEngine {
         mem.hasBase = false;
         mem.hasIndex = false;
 
-        // Remove brackets
+        // 移除方括号
         std::string expr = operand.substr(1, operand.length() - 2);
 
-        // Simple parser for [base+index*scale+disp] format
-        // This is a simplified version - real implementation would need better parsing
-
-        // For now, just handle simple cases like [rax], [rax+8], [rax+rbx*2+8]
-        std::regex simpleReg(R"(^(\w+)$)");
-        std::regex regPlusDisp(R"(^(\w+)\s*([+-])\s*(\d+)$)");
+        // 改进的解析器 - 支持 [reg+hex] 语法
+        std::regex patterns[] = {
+            std::regex(R"(^(\w+)$)"),                        // [reg]
+            std::regex(R"(^(\w+)\s*([+-])\s*([0-9A-Fa-f]+)$)"),  // [reg+hex] 或 [reg-hex]
+            std::regex(R"(^(\w+)\s*([+-])\s*0x([0-9A-Fa-f]+)$)") // [reg+0xhex]
+        };
 
         std::smatch match;
 
-        if (std::regex_match(expr, match, simpleReg)) {
-            // [reg]
+        // [reg]
+        if (std::regex_match(expr, match, patterns[0])) {
             mem.base = GetGpRegister(match[1].str());
             mem.hasBase = true;
+            return mem;
         }
-        else if (std::regex_match(expr, match, regPlusDisp)) {
-            // [reg+disp]
+
+        // [reg+hex] 或 [reg-hex]
+        if (std::regex_match(expr, match, patterns[1])) {
             mem.base = GetGpRegister(match[1].str());
             mem.hasBase = true;
-            mem.displacement = std::stoi(match[3].str());
+
+            // 解析偏移（默认十六进制）
+            std::string offsetStr = match[3].str();
+            mem.displacement = std::stoi(offsetStr, nullptr, 16);
+
             if (match[2].str() == "-") {
                 mem.displacement = -mem.displacement;
             }
+            return mem;
         }
-        // Add more complex parsing as needed
 
+        // [reg+0xhex]
+        if (std::regex_match(expr, match, patterns[2])) {
+            mem.base = GetGpRegister(match[1].str());
+            mem.hasBase = true;
+
+            std::string offsetStr = match[3].str();
+            mem.displacement = std::stoi(offsetStr, nullptr, 16);
+
+            if (match[2].str() == "-") {
+                mem.displacement = -mem.displacement;
+            }
+            return mem;
+        }
+
+        // 更复杂的模式...
         return mem;
     }
 

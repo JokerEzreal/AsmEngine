@@ -35,6 +35,7 @@ namespace AsmEngine {
         std::unique_ptr<AOBScanner> aobScanner_;
         std::unique_ptr<AssemblyEngine> assemblyEngine_;
         std::unique_ptr<ScriptParser> scriptParser_;
+        std::unique_ptr<TrampolineManager> trampolineManager_;
 
         // Configuration
         EngineConfig config_;

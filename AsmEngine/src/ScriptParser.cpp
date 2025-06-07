@@ -209,7 +209,13 @@ namespace AsmEngine {
         // Check if this is an anonymous label definition
         if (line == "@@:") {
             anonymousLabelCounter_++;
-            return "__anon_label_" + std::to_string(anonymousLabelCounter_) + ":";
+            std::string anonLabel = "__anon_label_" + std::to_string(anonymousLabelCounter_);
+
+            // 注册这个标签供后续引用
+            // 注意：地址将在后续根据上下文确定
+            std::cout << "[DEBUG] Created anonymous label: " << anonLabel << std::endl;
+
+            return anonLabel + ":";
         }
 
         // Replace @f with forward reference to next anonymous label
@@ -544,7 +550,9 @@ namespace AsmEngine {
 
         currentSection_ = &(*sectionIt);
 
-        // First pass: process all allocations and symbols
+        // ============ 第1遍：处理 AOB扫描、内存分配等 ============
+        std::cout << "[DEBUG] Pass 1: Processing allocations and scans..." << std::endl;
+
         for (const auto& cmd : sectionIt->commands) {
             try {
                 switch (cmd.type) {
@@ -577,18 +585,26 @@ namespace AsmEngine {
             }
         }
 
-        // Second pass: handle labels and assembly
-        std::map<std::string, std::vector<uint8_t>> codeBuffers;
+        // ============ 第2遍：处理标签和代码生成 ============
+        std::cout << "[DEBUG] Pass 2: Processing labels and assembly..." << std::endl;
+
         std::string currentLabel;
         AddressType currentWriteAddress = 0;
+        AddressType currentBaseAddress = 0;  // 当前代码段的基址
         bool hasValidLabel = false;
 
-        for (const auto& cmd : sectionIt->commands) {
+        // 用于跟踪内部标签
+        std::map<std::string, AddressType> pendingLabels;  // 待定标签
+        std::map<std::string, std::vector<uint8_t>> pendingCode;  // 待定代码
+
+        for (size_t cmdIndex = 0; cmdIndex < sectionIt->commands.size(); cmdIndex++) {
+            const auto& cmd = sectionIt->commands[cmdIndex];
+
             try {
                 switch (cmd.type) {
                 case CommandType::Label:
                 {
-                    // 如果上一个标签没有任何代码，清理它
+                    // 清理上一个空标签
                     if (!currentLabel.empty() &&
                         currentSection_->codeChunks.count(currentLabel) > 0 &&
                         currentSection_->codeChunks[currentLabel].empty()) {
@@ -603,37 +619,40 @@ namespace AsmEngine {
                         offset = std::stoull(cmd.arguments[1]);
                     }
 
-                    // 调试输出
                     std::cout << "[DEBUG] Processing label: " << baseLabelName;
                     if (offset > 0) {
                         std::cout << " + 0x" << std::hex << offset;
                     }
                     std::cout << std::dec << std::endl;
 
-                    // 解析基址 - 按优先级查找
+                    // 尝试解析基址
                     AddressType baseAddr = 0;
+                    bool resolved = false;
 
-                    // 1. 首先从符号管理器查找
+                    // 1. 从符号管理器查找
                     auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
                     if (resolvedAddr) {
                         baseAddr = *resolvedAddr;
+                        resolved = true;
                         std::cout << "[DEBUG] Resolved from symbols: 0x" << std::hex << baseAddr << std::dec << std::endl;
                     }
-                    // 2. 然后从当前section的labels查找
+                    // 2. 从section数据查找
                     else if (currentSection_->labels.count(baseLabelName)) {
                         baseAddr = currentSection_->labels[baseLabelName];
+                        resolved = true;
                         std::cout << "[DEBUG] Found in section labels: 0x" << std::hex << baseAddr << std::dec << std::endl;
                     }
-                    // 3. 最后从allocations查找（只对alloc的内存有效）
                     else if (currentSection_->allocations.count(baseLabelName)) {
                         baseAddr = currentSection_->allocations[baseLabelName];
+                        resolved = true;
                         std::cout << "[DEBUG] Found in allocations: 0x" << std::hex << baseAddr << std::dec << std::endl;
                     }
 
-                    if (baseAddr > 0) {
+                    if (resolved) {
+                        // 有明确基址的标签
                         currentWriteAddress = baseAddr + offset;
+                        currentBaseAddress = baseAddr;  // 记录基址
 
-                        // 创建当前标签名（带偏移的使用唯一名称）
                         if (offset > 0) {
                             currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
                         }
@@ -641,27 +660,49 @@ namespace AsmEngine {
                             currentLabel = baseLabelName;
                         }
 
-                        // 注册标签
                         currentSection_->labels[currentLabel] = currentWriteAddress;
                         engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
-
                         hasValidLabel = true;
 
                         std::cout << "[DEBUG] Current label: " << currentLabel
                             << " at 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
                     }
                     else {
-                        std::cout << "[ERROR] Could not resolve base address for label: "
-                            << baseLabelName << std::endl;
-                        hasValidLabel = false;
-                        currentLabel.clear();
+                        // 内部标签（如 code, return, health 等）
+                        // 这些标签的地址取决于它们在代码中的位置
+
+                        if (hasValidLabel && currentWriteAddress > 0) {
+                            // 如果当前有有效地址，这个标签继承当前地址
+                            if (offset > 0) {
+                                currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
+                                currentWriteAddress = currentBaseAddress + offset;
+                            }
+                            else {
+                                currentLabel = baseLabelName;
+                                // currentWriteAddress 保持不变，继续从当前位置
+                            }
+
+                            currentSection_->labels[currentLabel] = currentWriteAddress;
+                            engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
+
+                            std::cout << "[DEBUG] Internal label '" << currentLabel
+                                << "' at current position: 0x"
+                                << std::hex << currentWriteAddress << std::dec << std::endl;
+                        }
+                        else {
+                            // 没有当前地址，标记为待定
+                            currentLabel = baseLabelName;
+                            hasValidLabel = false;
+                            std::cout << "[WARNING] Label '" << baseLabelName
+                                << "' has no context, marked as pending" << std::endl;
+                        }
                     }
                 }
                 break;
 
                 case CommandType::Asm:
                     if (hasValidLabel && currentWriteAddress > 0) {
-                        // 处理多个nop
+                        // 处理汇编指令
                         if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
                             int count = std::stoi(cmd.arguments[0]);
                             std::vector<uint8_t> nops(count, 0x90);
@@ -675,7 +716,7 @@ namespace AsmEngine {
                             currentWriteAddress += count;
                         }
                         else {
-                            // 正常的汇编指令
+                            // 构建汇编指令
                             std::string asmLine = cmd.name;
                             for (const auto& arg : cmd.arguments) {
                                 asmLine += " " + arg;
@@ -689,7 +730,8 @@ namespace AsmEngine {
                             if (result && !result->empty()) {
                                 std::cout << "[DEBUG] Assembled " << result->size() << " bytes: ";
                                 for (size_t i = 0; i < std::min<size_t>(result->size(), 16); ++i) {
-                                    std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)(*result)[i] << " ";
+                                    std::cout << std::hex << std::setw(2) << std::setfill('0')
+                                        << (int)(*result)[i] << " ";
                                 }
                                 if (result->size() > 16) {
                                     std::cout << "...";
@@ -701,7 +743,6 @@ namespace AsmEngine {
                                     result->begin(), result->end()
                                 );
 
-                                // 更新写入地址以供下一条指令使用
                                 currentWriteAddress += result->size();
                             }
                             else {
@@ -709,10 +750,37 @@ namespace AsmEngine {
                             }
                         }
                     }
-                    else {
-                        std::cout << "[WARNING] No valid label for assembly: " << cmd.name
-                            << " (hasValidLabel=" << hasValidLabel
-                            << ", currentWriteAddress=0x" << std::hex << currentWriteAddress << std::dec << ")" << std::endl;
+                    else if (!currentLabel.empty()) {
+                        // 如果当前标签无效，但之前有 newmem 这样的基址
+                        // 尝试使用最近的有效基址
+                        if (currentBaseAddress > 0) {
+                            // 为待定标签分配地址
+                            currentWriteAddress = currentBaseAddress + currentSection_->codeChunks[currentLabel].size();
+                            currentSection_->labels[currentLabel] = currentWriteAddress;
+                            engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
+                            hasValidLabel = true;
+
+                            std::cout << "[DEBUG] Assigned address to pending label '" << currentLabel
+                                << "': 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
+
+                            // 重试汇编
+                            std::string asmLine = cmd.name;
+                            for (const auto& arg : cmd.arguments) {
+                                asmLine += " " + arg;
+                            }
+
+                            auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentWriteAddress);
+                            if (result && !result->empty()) {
+                                currentSection_->codeChunks[currentLabel].insert(
+                                    currentSection_->codeChunks[currentLabel].end(),
+                                    result->begin(), result->end()
+                                );
+                                currentWriteAddress += result->size();
+                            }
+                        }
+                        else {
+                            std::cout << "[WARNING] No valid context for assembly: " << cmd.name << std::endl;
+                        }
                     }
                     break;
 
@@ -722,10 +790,9 @@ namespace AsmEngine {
                     if (hasValidLabel && currentWriteAddress > 0) {
                         HandleDataDefinition(cmd);
 
-                        // Update write address based on data size
+                        // 更新地址
                         size_t dataSize = 0;
                         if (cmd.type == CommandType::Db) {
-                            // 对于 db，需要考虑捕获值可能是多字节的
                             for (const auto& arg : cmd.arguments) {
                                 if (engine_->Captures()->Exists(arg)) {
                                     auto capture = engine_->Captures()->Get(arg);
@@ -734,7 +801,7 @@ namespace AsmEngine {
                                     }
                                 }
                                 else {
-                                    dataSize += 1;  // 普通字节
+                                    dataSize += 1;
                                 }
                             }
                         }
@@ -746,7 +813,7 @@ namespace AsmEngine {
                         }
 
                         currentWriteAddress += dataSize;
-                        std::cout << "[DEBUG] Data definition added " << dataSize << " bytes, new address: 0x"
+                        std::cout << "[DEBUG] Data added " << dataSize << " bytes, new address: 0x"
                             << std::hex << currentWriteAddress << std::dec << std::endl;
                     }
                     break;
@@ -768,7 +835,7 @@ namespace AsmEngine {
             currentSection_->codeChunks.erase(currentLabel);
         }
 
-        // 清理所有空的 code chunks
+        // ============ 清理所有空的 code chunks ============
         std::cout << "[DEBUG] Cleaning up empty code chunks..." << std::endl;
         auto it = currentSection_->codeChunks.begin();
         while (it != currentSection_->codeChunks.end()) {
@@ -781,10 +848,10 @@ namespace AsmEngine {
             }
         }
 
-        // Third pass: write code to memory
+        // ============ 第3遍：写入内存 ============
         WriteCodeToMemory();
 
-        // Fourth pass: cleanup commands
+        // ============ 第4遍：清理 ============
         for (const auto& cmd : sectionIt->commands) {
             try {
                 if (cmd.type == CommandType::Dealloc) {
@@ -1009,18 +1076,27 @@ namespace AsmEngine {
         std::vector<uint8_t> data;
 
         if (cmd.type == CommandType::Db) {
-            // Define bytes - handle captures and hex values
+            // Define bytes - 正确处理捕获值
             for (const auto& arg : cmd.arguments) {
                 if (engine_->Captures()->Exists(arg)) {
                     auto capture = engine_->Captures()->Get(arg);
                     if (capture) {
-                        for (uint8_t byte : capture->data) {
-                            data.push_back(byte);
+                        // 对于 db，如果捕获是多字节，只使用第一个字节
+                        // 除非明确要求使用所有字节
+                        if (capture->size == 1) {
+                            data.push_back(capture->AsUInt8());
+                        }
+                        else {
+                            // 对于 s1 这样的2字节捕获，在 db 中应该如何处理？
+                            // CE 可能期望插入所有字节
+                            for (uint8_t byte : capture->data) {
+                                data.push_back(byte);
+                            }
                         }
                     }
                 }
                 else {
-                    // Use the common number parser
+                    // 使用通用数字解析器
                     uint64_t value = ParseNumber(arg);
                     data.push_back(value & 0xFF);
                 }
