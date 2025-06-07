@@ -417,6 +417,25 @@ namespace AsmEngine {
         return detour;
     }
 
+    std::optional<AssemblyEngine::CodeCave> AssemblyEngine::FindCodeCave(
+        AddressType nearAddress, size_t minSize) const {
+
+        // This is a basic implementation that looks for a sequence of NOPs or CC (int3)
+        // In a real implementation, you'd want more sophisticated cave detection
+
+        if (!symbolManager_) {
+            return std::nullopt;
+        }
+
+        // Search in a 2GB range around the target address
+        const size_t searchRange = 0x7FFFFFFF; // 2GB - 1
+        const size_t pageSize = 0x1000; // 4KB
+
+        // TODO: Implement actual code cave searching logic
+        // For now, return nullopt
+        return std::nullopt;
+    }
+
     std::optional<AssemblyEngine::HookInfo> AssemblyEngine::CreateHook(
         AddressType targetAddress, const std::string& hookCode) {
 

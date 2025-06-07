@@ -95,31 +95,85 @@ namespace AsmEngine {
         MemoryProtection protection) {
         std::lock_guard lock(mutex_);
 
+        // Try to find suitable address near target
         AddressType targetAddress = FindNearAddress(nearAddress, size);
         if (!targetAddress) {
-            // Fallback to regular allocation
+            // If no suitable address found near target, try regular allocation
             return AllocateMemory(size, protection);
         }
 
+        // Try to allocate at the specific address
         LPVOID allocatedAddress = VirtualAllocEx(processHandle_,
             reinterpret_cast<LPVOID>(targetAddress),
             size, MEM_COMMIT | MEM_RESERVE,
             static_cast<DWORD>(protection));
 
         if (!allocatedAddress) {
-            // Try regular allocation as fallback
-            return AllocateMemory(size, protection);
+            // If specific address fails, let Windows choose within range
+            // This is done by trying multiple addresses
+            const size_t maxAttempts = 100;
+            const size_t stepSize = 0x10000; // 64KB steps
+
+            // Try addresses above target
+            for (size_t i = 0; i < maxAttempts / 2; i++) {
+                targetAddress = nearAddress + (i * stepSize);
+                allocatedAddress = VirtualAllocEx(processHandle_,
+                    reinterpret_cast<LPVOID>(targetAddress),
+                    size, MEM_COMMIT | MEM_RESERVE,
+                    static_cast<DWORD>(protection));
+
+                if (allocatedAddress) {
+                    // Verify it's within acceptable range
+                    AddressType allocAddr = reinterpret_cast<AddressType>(allocatedAddress);
+                    int64_t distance = static_cast<int64_t>(allocAddr) - static_cast<int64_t>(nearAddress);
+                    if (std::abs(distance) <= 0x7FFFFFFF) {
+                        break;
+                    }
+                    else {
+                        // Too far, free and continue
+                        VirtualFreeEx(processHandle_, allocatedAddress, 0, MEM_RELEASE);
+                        allocatedAddress = nullptr;
+                    }
+                }
+            }
+
+            // Try addresses below target if still not found
+            if (!allocatedAddress) {
+                for (size_t i = 1; i <= maxAttempts / 2; i++) {
+                    if (nearAddress < i * stepSize) break;
+                    targetAddress = nearAddress - (i * stepSize);
+
+                    allocatedAddress = VirtualAllocEx(processHandle_,
+                        reinterpret_cast<LPVOID>(targetAddress),
+                        size, MEM_COMMIT | MEM_RESERVE,
+                        static_cast<DWORD>(protection));
+
+                    if (allocatedAddress) {
+                        AddressType allocAddr = reinterpret_cast<AddressType>(allocatedAddress);
+                        int64_t distance = static_cast<int64_t>(allocAddr) - static_cast<int64_t>(nearAddress);
+                        if (std::abs(distance) <= 0x7FFFFFFF) {
+                            break;
+                        }
+                        else {
+                            VirtualFreeEx(processHandle_, allocatedAddress, 0, MEM_RELEASE);
+                            allocatedAddress = nullptr;
+                        }
+                    }
+                }
+            }
         }
 
-        AllocatedRegion region;
-        region.address = reinterpret_cast<AddressType>(allocatedAddress);
-        region.size = size;
-        region.protection = protection;
-        region.allocationTime = std::chrono::system_clock::now();
+        if (allocatedAddress) {
+            AllocatedRegion region;
+            region.address = reinterpret_cast<AddressType>(allocatedAddress);
+            region.size = size;
+            region.protection = protection;
+            region.allocationTime = std::chrono::system_clock::now();
 
-        allocatedRegions_.push_back(region);
+            allocatedRegions_.push_back(region);
+        }
 
-        return region.address;
+        return reinterpret_cast<AddressType>(allocatedAddress);
     }
 
     bool MemoryManager::FreeMemory(AddressType address) {

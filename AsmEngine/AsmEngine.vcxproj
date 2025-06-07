@@ -42,6 +42,9 @@
     <ClCompile Include="src\SymbolManager.cpp" />
     <ClCompile Include="src\TrampolineManager.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+  </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>
     <Keyword>Win32Proj</Keyword>

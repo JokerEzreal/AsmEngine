@@ -1,6 +1,7 @@
 ﻿#include "AsmEngine.h"
 #include <TlHelp32.h>
 #include <algorithm>
+#include <iostream>
 
 namespace AsmEngine {
 
@@ -213,8 +214,8 @@ namespace AsmEngine {
             return false;
         }
 
-        // Allocate memory for detour near target
-        AddressType detourAddress = memoryManager_->AllocateNear(*targetAddress, 4096);
+        // Allocate memory for detour code
+        AddressType detourAddress = memoryManager_->AllocateMemory(4096);
         if (!detourAddress) {
             HandleError(ErrorCode::AllocationError, "Failed to allocate detour memory");
             return false;
@@ -236,26 +237,81 @@ namespace AsmEngine {
             return false;
         }
 
-        // Create jump from target to detour
-        auto jump = assemblyEngine_->GenerateJump(*targetAddress, detourAddress);
-
-        // Backup original bytes
-        ByteVector originalBytes(jump.size());
-        if (!memoryManager_->ReadMemory(*targetAddress, originalBytes.data(),
-            originalBytes.size())) {
-            HandleError(ErrorCode::MemoryAccessError, "Failed to read original bytes");
+        // Use TrampolineManager to create the hook
+        if (!trampolineManager_->CreateHook(*targetAddress, detourAddress, targetSymbol)) {
+            HandleError(ErrorCode::AllocationError, "Failed to create hook via trampoline");
             memoryManager_->FreeMemory(detourAddress);
             return false;
         }
 
-        // Write jump
-        if (!memoryManager_->WriteMemory(*targetAddress, jump.data(), jump.size())) {
-            HandleError(ErrorCode::MemoryAccessError, "Failed to write jump");
-            memoryManager_->FreeMemory(detourAddress);
+        std::cout << "[AsmEngine] Detour created successfully:" << std::endl;
+        std::cout << "  Target: " << targetSymbol << " (0x" << std::hex << *targetAddress << ")" << std::endl;
+        std::cout << "  Detour Code: 0x" << detourAddress << std::dec << std::endl;
+
+        return true;
+    }
+
+    bool AsmEngine::CreateHook(AddressType targetAddress,
+        const std::string& hookCode,
+        const std::string& description) {
+        if (!isAttached_) {
+            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
+            return false;
+        }
+
+        // Allocate memory for hook code
+        AddressType hookCodeAddress = memoryManager_->AllocateMemory(4096);
+        if (!hookCodeAddress) {
+            HandleError(ErrorCode::AllocationError, "Failed to allocate hook memory");
+            return false;
+        }
+
+        // Assemble hook code
+        auto assembled = assemblyEngine_->Assemble(hookCode, hookCodeAddress);
+        if (!assembled) {
+            HandleError(ErrorCode::AssemblyError, "Failed to assemble hook code");
+            memoryManager_->FreeMemory(hookCodeAddress);
+            return false;
+        }
+
+        // Write hook code
+        if (!memoryManager_->WriteMemory(hookCodeAddress, assembled->machineCode.data(),
+            assembled->machineCode.size())) {
+            HandleError(ErrorCode::MemoryAccessError, "Failed to write hook code");
+            memoryManager_->FreeMemory(hookCodeAddress);
+            return false;
+        }
+
+        // Use TrampolineManager to create the hook
+        if (!trampolineManager_->CreateHook(targetAddress, hookCodeAddress, description)) {
+            HandleError(ErrorCode::AllocationError, "Failed to create hook via trampoline");
+            memoryManager_->FreeMemory(hookCodeAddress);
             return false;
         }
 
         return true;
+    }
+
+    bool AsmEngine::RemoveHook(AddressType targetAddress) {
+        if (!isAttached_) {
+            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
+            return false;
+        }
+
+        return trampolineManager_->RemoveHook(targetAddress);
+    }
+
+    std::vector<std::pair<AddressType, AddressType>> AsmEngine::GetActiveHooks() const {
+        std::vector<std::pair<AddressType, AddressType>> result;
+
+        if (trampolineManager_) {
+            auto hooks = trampolineManager_->GetAllHooks();
+            for (const auto& hook : hooks) {
+                result.push_back({ hook.originalAddress, hook.hookCodeAddress });
+            }
+        }
+
+        return result;
     }
 
     bool AsmEngine::WriteAssembly(AddressType address, const std::string& assembly) {
