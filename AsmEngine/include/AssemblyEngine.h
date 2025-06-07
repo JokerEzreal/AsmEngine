@@ -39,6 +39,9 @@ namespace AsmEngine {
         // Replace capture references with actual values
         std::string ReplaceCaptureReferences(const std::string& line) const;
 
+        std::string ProcessMemoryToken(const std::string& token) const;
+        bool IsRegisterName(const std::string& token) const;
+
         // Replace symbol references with addresses
         std::string ReplaceSymbolReferences(const std::string& line) const;
 

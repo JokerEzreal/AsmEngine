@@ -117,6 +117,9 @@ namespace AsmEngine {
         AddressType GetCurrentAddress() const;
         void WriteCodeToMemory();
 
+        void PreResolveLabels();
+        void ResolveForwardReferences();
+
     public:
         ScriptParser(AsmEngine* engine);
         ~ScriptParser() = default;

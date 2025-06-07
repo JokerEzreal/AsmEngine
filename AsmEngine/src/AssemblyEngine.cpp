@@ -4,6 +4,7 @@
 #include <sstream>
 #include <asmjit/x86.h>
 #include <iostream>
+#include <set>
 
 namespace AsmEngine {
 
@@ -24,57 +25,266 @@ namespace AsmEngine {
     std::string AssemblyEngine::FixMemoryExpression(const std::string& expr) const {
         std::string fixed = expr;
 
-        // 匹配 reg+number 或 reg-number 模式
-        std::regex offsetRegex(R"(([a-zA-Z]+[0-9]*)([+-])([0-9A-Fa-f]+))");
+        // Pattern to match register+offset or register-offset
+        // This handles cases like rax+30, rdx-0C, etc.
+        std::regex offsetRegex(R"(([a-zA-Z]+[0-9]*)([+-])([0-9A-Fa-f]+)\b)");
         std::smatch match;
 
-        if (std::regex_match(expr, match, offsetRegex)) {
+        std::string result;
+        std::string temp = fixed;
+
+        while (std::regex_search(temp, match, offsetRegex)) {
+            result += temp.substr(0, match.position());
+
             std::string reg = match[1].str();
             std::string sign = match[2].str();
             std::string offset = match[3].str();
 
-            // 确保偏移量有0x前缀
+            // Check if offset already has 0x prefix
             if (offset.substr(0, 2) != "0x" && offset.substr(0, 2) != "0X") {
-                offset = "0x" + offset;
+                // Check if it looks like a hex number
+                bool hasHexDigit = false;
+                for (char c : offset) {
+                    if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+                        hasHexDigit = true;
+                        break;
+                    }
+                }
+
+                // Add 0x prefix for hex numbers
+                if (hasHexDigit || offset.length() > 2) {
+                    offset = "0x" + offset;
+                }
             }
 
-            fixed = reg + sign + offset;
-        }
-
-        return fixed;
-    }
-
-    std::string AssemblyEngine::PreprocessAssembly(const std::string& assembly,
-        AddressType baseAddress) const {
-        std::string processed = assembly;
-
-        // 替换捕获引用
-        processed = ReplaceCaptureReferences(processed);
-
-        // 替换符号引用
-        processed = ReplaceSymbolReferences(processed);
-
-        // 修复方括号内的语法
-        // 将 [reg+hex] 转换为 [reg+0xhex]
-        std::regex bracketRegex(R"(\[([^]]+)\])");
-        std::smatch match;
-        std::string temp = processed;
-        std::string result;
-
-        while (std::regex_search(temp, match, bracketRegex)) {
-            result += temp.substr(0, match.position());
-
-            std::string memExpr = match[1].str();
-            // 处理内存表达式
-            std::string fixedExpr = FixMemoryExpression(memExpr);
-            result += "[" + fixedExpr + "]";
-
+            result += reg + sign + offset;
             temp = match.suffix();
         }
         result += temp;
 
         return result;
     }
+
+    std::string AssemblyEngine::PreprocessAssembly(const std::string& assembly,
+        AddressType baseAddress) const {
+
+        std::string processed = assembly;
+
+        // Step 1: Replace capture references (s1, s2, etc.)
+        processed = ReplaceCaptureReferences(processed);
+
+        // Step 2: Process memory expressions and resolve symbols
+        // This handles patterns like [player], [rax+s1], [rbx+symbol], etc.
+        std::regex memExprRegex(R"(\[([^\]]+)\])");
+        std::smatch match;
+        std::string result;
+        size_t lastPos = 0;
+
+        auto tempStr = processed;
+        while (std::regex_search(tempStr, match, memExprRegex)) {
+            // Add everything before the match
+            result += tempStr.substr(0, match.position());
+
+            std::string memExpr = match[1].str();
+            std::string processedExpr;
+
+            // Parse the memory expression
+            std::string currentToken;
+            bool inNumber = false;
+            bool lastWasOperator = false;
+
+            for (size_t i = 0; i < memExpr.length(); ++i) {
+                char c = memExpr[i];
+
+                if (c == '+' || c == '-' || c == '*') {
+                    // Handle accumulated token
+                    if (!currentToken.empty()) {
+                        processedExpr += ProcessMemoryToken(currentToken);
+                        currentToken.clear();
+                    }
+                    processedExpr += c;
+                    lastWasOperator = true;
+                }
+                else if (c == ' ' || c == '\t') {
+                    // Handle accumulated token
+                    if (!currentToken.empty()) {
+                        processedExpr += ProcessMemoryToken(currentToken);
+                        currentToken.clear();
+                    }
+                    if (!processedExpr.empty() && processedExpr.back() != ' ') {
+                        processedExpr += ' ';
+                    }
+                }
+                else {
+                    currentToken += c;
+                    lastWasOperator = false;
+                }
+            }
+
+            // Handle final token
+            if (!currentToken.empty()) {
+                processedExpr += ProcessMemoryToken(currentToken);
+            }
+
+            result += "[" + processedExpr + "]";
+            tempStr = match.suffix();
+        }
+        result += tempStr;
+
+        // Step 3: Process immediate values and symbol references outside of memory expressions
+        processed = result;
+        result.clear();
+
+        // Split by whitespace and commas to process each token
+        std::regex tokenRegex(R"([\s,]+)");
+        std::sregex_token_iterator it(processed.begin(), processed.end(), tokenRegex, -1);
+        std::sregex_token_iterator end;
+
+        bool first = true;
+        std::string lastDelimiter;
+
+        for (; it != end; ++it) {
+            std::string token = it->str();
+
+            if (!first && !lastDelimiter.empty()) {
+                result += lastDelimiter;
+            }
+            first = false;
+
+            // Skip if token is empty
+            if (token.empty()) {
+                continue;
+            }
+
+            // Skip if token contains brackets (already processed)
+            if (token.find('[') != std::string::npos || token.find(']') != std::string::npos) {
+                result += token;
+            }
+            // Skip if it's an instruction mnemonic (first token on line)
+            else if (result.empty() || result.back() == '\n') {
+                result += token;
+            }
+            // Skip register names
+            else if (IsRegisterName(token)) {
+                result += token;
+            }
+            // Try to resolve as symbol
+            else if (symbolManager_) {
+                auto addr = symbolManager_->ResolveAddress(token);
+                if (addr) {
+                    std::stringstream ss;
+                    ss << "0x" << std::hex << *addr;
+                    result += ss.str();
+                }
+                else {
+                    result += token;
+                }
+            }
+            else {
+                result += token;
+            }
+
+            // Capture delimiter for next iteration
+            if (std::distance(it, end) > 1) {
+                auto pos = processed.find(token);
+                if (pos != std::string::npos) {
+                    pos += token.length();
+                    if (pos < processed.length()) {
+                        lastDelimiter.clear();
+                        while (pos < processed.length() &&
+                            (processed[pos] == ' ' || processed[pos] == ',' ||
+                                processed[pos] == '\t')) {
+                            lastDelimiter += processed[pos++];
+                        }
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    // Helper method to process tokens inside memory expressions
+    std::string AssemblyEngine::ProcessMemoryToken(const std::string& token) const {
+        // Check if it's a register
+        if (IsRegisterName(token)) {
+            return token;
+        }
+
+        // Check if it's already a number (hex or decimal)
+        if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) {
+            return token;  // Already hex
+        }
+
+        // Check if it's a pure hex number without 0x prefix
+        bool isPureHex = true;
+        for (char c : token) {
+            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                isPureHex = false;
+                break;
+            }
+        }
+
+        if (isPureHex && !token.empty()) {
+            // Check if it looks like a hex number (has A-F)
+            bool hasHexDigit = false;
+            for (char c : token) {
+                if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+                    hasHexDigit = true;
+                    break;
+                }
+            }
+
+            if (hasHexDigit || token.length() > 2) {
+                return "0x" + token;  // Add 0x prefix
+            }
+            else {
+                return token;  // Keep as is (might be small decimal)
+            }
+        }
+
+        // Try to resolve as symbol
+        if (symbolManager_) {
+            auto addr = symbolManager_->ResolveAddress(token);
+            if (addr) {
+                std::stringstream ss;
+                ss << "0x" << std::hex << *addr;
+                return ss.str();
+            }
+        }
+
+        // Return as is if can't resolve
+        return token;
+    }
+
+    // Helper method to check if a token is a register name
+    bool AssemblyEngine::IsRegisterName(const std::string& token) const {
+        static const std::set<std::string> registers = {
+            // 64-bit registers
+            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
+            // 32-bit registers
+            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
+            "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
+            // 16-bit registers
+            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
+            "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
+            // 8-bit registers
+            "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
+            "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
+            "ah", "bh", "ch", "dh",
+            // Segment registers
+            "cs", "ds", "es", "fs", "gs", "ss",
+            // Special registers
+            "rip", "eip", "ip"
+        };
+
+        return registers.find(token) != registers.end();
+    }
+
+    // Also add these method declarations to AssemblyEngine.h under private:
+    // std::string ProcessMemoryToken(const std::string& token) const;
+    // bool IsRegisterName(const std::string& token) const;
 
     std::string AssemblyEngine::ReplaceCaptureReferences(const std::string& line) const {
         if (!captureStorage_) {
@@ -84,54 +294,10 @@ namespace AsmEngine {
         std::string result = line;
         auto captureNames = captureStorage_->GetAllNames();
 
-        // 调试输出
+        // Debug output
         if (!captureNames.empty() && (line.find("s1") != std::string::npos ||
             line.find("s2") != std::string::npos)) {
             std::cout << "[DEBUG] ReplaceCaptureReferences: input = '" << line << "'" << std::endl;
-        }
-
-        // 先处理内存引用中的十六进制数（如 [rax+30], [rdx-0C]）
-        std::regex memOffsetRegex(R"(\[([^\]]+)\])");
-        std::smatch memMatch;
-        std::string temp = result;
-
-        while (std::regex_search(temp, memMatch, memOffsetRegex)) {
-            std::string memExpr = memMatch[1].str();
-            std::string processedExpr = memExpr;
-
-            // 处理加减偏移
-            std::regex offsetRegex(R"(([+-])([0-9A-Fa-f]+)\b)");
-            std::smatch offsetMatch;
-            std::string tempExpr = processedExpr;
-            std::string newExpr;
-            size_t lastPos = 0;
-
-            while (std::regex_search(tempExpr, offsetMatch, offsetRegex)) {
-                // 添加匹配前的部分
-                newExpr += tempExpr.substr(0, offsetMatch.position());
-
-                std::string sign = offsetMatch[1].str();
-                std::string num = offsetMatch[2].str();
-
-                // 添加处理后的偏移（确保是0x格式）
-                newExpr += sign + "0x" + num;
-
-                // 移动到下一个搜索位置
-                lastPos = offsetMatch.position() + offsetMatch.length();
-                tempExpr = tempExpr.substr(lastPos);
-            }
-
-            // 添加剩余部分
-            newExpr += tempExpr;
-            processedExpr = newExpr;
-
-            // 替换原始表达式
-            size_t pos = result.find(memMatch[0].str());
-            if (pos != std::string::npos) {
-                result.replace(pos, memMatch[0].length(), "[" + processedExpr + "]");
-            }
-
-            temp = memMatch.suffix();
         }
 
         // Sort by length (descending) to replace longer names first
@@ -143,6 +309,7 @@ namespace AsmEngine {
         // Replace each capture reference
         for (const auto& captureName : captureNames) {
             // Create regex that matches the capture name as a whole word
+            // This handles cases like s1, s2 in expressions like [rax+s1]
             std::regex captureRegex(R"(\b)" + captureName + R"(\b)");
 
             auto capture = captureStorage_->Get(captureName);
@@ -153,28 +320,53 @@ namespace AsmEngine {
 
             switch (capture->size) {
             case 1:
-                replacement = std::to_string(capture->AsUInt8());
-                break;
+            {
+                std::stringstream ss;
+                ss << "0x" << std::hex << static_cast<unsigned>(capture->AsUInt8());
+                replacement = ss.str();
+            }
+            break;
             case 2:
-                replacement = std::to_string(capture->AsUInt16());
-                break;
+            {
+                std::stringstream ss;
+                ss << "0x" << std::hex << capture->AsUInt16();
+                replacement = ss.str();
+            }
+            break;
             case 4:
-                replacement = std::to_string(capture->AsUInt32());
-                break;
+            {
+                std::stringstream ss;
+                ss << "0x" << std::hex << capture->AsUInt32();
+                replacement = ss.str();
+            }
+            break;
             case 8:
-                replacement = std::to_string(capture->AsUInt64());
-                break;
+            {
+                std::stringstream ss;
+                ss << "0x" << std::hex << capture->AsUInt64();
+                replacement = ss.str();
+            }
+            break;
             default:
                 // For other sizes, use hex representation
                 replacement = "0x" + BytesToString(capture->data);
                 break;
             }
 
-            result = std::regex_replace(result, captureRegex, replacement);
+            // Replace all occurrences
+            try {
+                result = std::regex_replace(result, captureRegex, replacement);
+            }
+            catch (const std::regex_error& e) {
+                std::cout << "[WARNING] Failed to replace capture '" << captureName
+                    << "': " << e.what() << std::endl;
+            }
         }
+
         if (!captureNames.empty() && result != line) {
             std::cout << "[DEBUG] ReplaceCaptureReferences: output = '" << result << "'" << std::endl;
         }
+
         return result;
     }
 
@@ -211,10 +403,20 @@ namespace AsmEngine {
                 }
             }
 
-            std::regex symbolRegex(R"(\b)" + symbol.name + R"(\b)");
+            // Create a more specific regex that won't match inside brackets if the symbol isn't resolved
+            // This prevents regex errors when we have [unresolved_symbol]
+            std::regex symbolRegex(R"(\b)" + symbol.name + R"(\b(?![^\[]*\]))");
             std::stringstream replacement;
             replacement << "0x" << std::hex << symbol.address;
-            result = std::regex_replace(result, symbolRegex, replacement.str());
+
+            try {
+                result = std::regex_replace(result, symbolRegex, replacement.str());
+            }
+            catch (const std::regex_error& e) {
+                // If regex fails, skip this symbol
+                std::cout << "[WARNING] Failed to replace symbol '" << symbol.name
+                    << "': " << e.what() << std::endl;
+            }
         }
 
         return result;

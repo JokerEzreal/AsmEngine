@@ -6,6 +6,7 @@
 #include <sstream>
 #include <iomanip>
 #include <iostream>
+#include <set>
 
 namespace AsmEngine {
 
@@ -318,6 +319,21 @@ namespace AsmEngine {
         std::vector<std::string> tokens;
         std::string processedLine = line;
 
+        if (processedLine.find("label(") == 0) {
+            // Extract label command and its argument
+            size_t startParen = processedLine.find('(');
+            size_t endParen = processedLine.find(')');
+
+            if (startParen != std::string::npos && endParen != std::string::npos &&
+                endParen > startParen) {
+                tokens.push_back("label");
+                std::string labelName = processedLine.substr(startParen + 1,
+                    endParen - startParen - 1);
+                tokens.push_back(labelName);
+                return tokens;
+            }
+        }
+
         // Handle parentheses syntax for commands
         std::regex cmdWithParens(R"(^(\w+)\s*\((.*)\)\s*$)");
         std::smatch match;
@@ -550,8 +566,11 @@ namespace AsmEngine {
 
         currentSection_ = &(*sectionIt);
 
-        // ============ 第1遍：处理 AOB扫描、内存分配等 ============
-        std::cout << "[DEBUG] Pass 1: Processing allocations and scans..." << std::endl;
+        // ============ 第1遍：处理 AOB扫描、内存分配、label声明 ============
+        std::cout << "[DEBUG] Pass 1: Processing allocations, scans and label declarations..." << std::endl;
+
+        // Track declared labels for forward reference resolution
+        std::set<std::string> declaredLabels;
 
         for (const auto& cmd : sectionIt->commands) {
             try {
@@ -576,6 +595,14 @@ namespace AsmEngine {
                     HandleDefine(cmd);
                     break;
 
+                case CommandType::Label:
+                    // Handle label() declarations
+                    if (cmd.name == "label" && !cmd.arguments.empty()) {
+                        declaredLabels.insert(cmd.arguments[0]);
+                        std::cout << "[DEBUG] Declared label: " << cmd.arguments[0] << std::endl;
+                    }
+                    break;
+
                 default:
                     break;
                 }
@@ -585,17 +612,98 @@ namespace AsmEngine {
             }
         }
 
+        // ============ 预解析遍：解析所有标签定义和它们的地址 ============
+        std::cout << "[DEBUG] Pre-resolve pass: Finding all label definitions..." << std::endl;
+
+        // Map to store pre-resolved label addresses
+        std::map<std::string, AddressType> preresolvedLabels;
+
+        for (size_t i = 0; i < sectionIt->commands.size(); i++) {
+            const auto& cmd = sectionIt->commands[i];
+
+            if (cmd.type == CommandType::Label && cmd.name != "label") {
+                std::string baseLabelName = cmd.arguments[0];
+                size_t offset = 0;
+
+                if (cmd.arguments.size() > 1) {
+                    offset = std::stoull(cmd.arguments[1]);
+                }
+
+                // Try to resolve base address
+                AddressType baseAddr = 0;
+                bool hasBase = false;
+
+                auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
+                if (resolvedAddr) {
+                    baseAddr = *resolvedAddr;
+                    hasBase = true;
+                }
+                else if (currentSection_->allocations.count(baseLabelName)) {
+                    baseAddr = currentSection_->allocations[baseLabelName];
+                    hasBase = true;
+                }
+
+                if (hasBase) {
+                    AddressType currentAddr = baseAddr + offset;
+
+                    // Look ahead for data labels that follow immediately
+                    for (size_t j = i + 1; j < sectionIt->commands.size(); j++) {
+                        const auto& nextCmd = sectionIt->commands[j];
+
+                        // Stop if we hit another label with offset
+                        if (nextCmd.type == CommandType::Label &&
+                            nextCmd.arguments.size() > 1 &&
+                            nextCmd.name != "label") {
+                            break;
+                        }
+
+                        // If it's a simple label definition (labelname:)
+                        if (nextCmd.type == CommandType::Label &&
+                            nextCmd.arguments.size() == 1 &&
+                            nextCmd.name != "label") {
+                            std::string sublabel = nextCmd.arguments[0];
+                            preresolvedLabels[sublabel] = currentAddr;
+
+                            // Look at the next command to determine size
+                            if (j + 1 < sectionIt->commands.size()) {
+                                const auto& dataCmd = sectionIt->commands[j + 1];
+                                if (dataCmd.type == CommandType::Dd) {
+                                    currentAddr += 4;  // dd is 4 bytes
+                                }
+                                else if (dataCmd.type == CommandType::Dq) {
+                                    currentAddr += 8;  // dq is 8 bytes
+                                }
+                                else if (dataCmd.type == CommandType::Db) {
+                                    currentAddr += dataCmd.arguments.size();  // db is 1 byte per argument
+                                }
+                            }
+                        }
+                        else if (nextCmd.type != CommandType::Dd &&
+                            nextCmd.type != CommandType::Dq &&
+                            nextCmd.type != CommandType::Db) {
+                            // Any other command type, stop scanning
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register all pre-resolved labels
+        for (const auto& [label, addr] : preresolvedLabels) {
+            engine_->Symbols()->RegisterSymbol(label, addr);
+            currentSection_->labels[label] = addr;
+            std::cout << "[DEBUG] Pre-resolved label '" << label
+                << "' at 0x" << std::hex << addr << std::dec << std::endl;
+        }
+
         // ============ 第2遍：处理标签和代码生成 ============
         std::cout << "[DEBUG] Pass 2: Processing labels and assembly..." << std::endl;
 
         std::string currentLabel;
         AddressType currentWriteAddress = 0;
-        AddressType currentBaseAddress = 0;  // 当前代码段的基址
+        AddressType currentBaseAddress = 0;
         bool hasValidLabel = false;
-
-        // 用于跟踪内部标签
-        std::map<std::string, AddressType> pendingLabels;  // 待定标签
-        std::map<std::string, std::vector<uint8_t>> pendingCode;  // 待定代码
 
         for (size_t cmdIndex = 0; cmdIndex < sectionIt->commands.size(); cmdIndex++) {
             const auto& cmd = sectionIt->commands[cmdIndex];
@@ -603,106 +711,89 @@ namespace AsmEngine {
             try {
                 switch (cmd.type) {
                 case CommandType::Label:
-                {
-                    // 清理上一个空标签
-                    if (!currentLabel.empty() &&
-                        currentSection_->codeChunks.count(currentLabel) > 0 &&
-                        currentSection_->codeChunks[currentLabel].empty()) {
-                        std::cout << "[DEBUG] Removing empty code chunk for label: " << currentLabel << std::endl;
-                        currentSection_->codeChunks.erase(currentLabel);
+                    // Skip label() declarations
+                    if (cmd.name == "label") {
+                        continue;
                     }
 
-                    std::string baseLabelName = cmd.arguments[0];
-                    size_t offset = 0;
+                    {
+                        // Clean up previous empty label
+                        if (!currentLabel.empty() &&
+                            currentSection_->codeChunks.count(currentLabel) > 0 &&
+                            currentSection_->codeChunks[currentLabel].empty()) {
+                            std::cout << "[DEBUG] Removing empty code chunk for label: " << currentLabel << std::endl;
+                            currentSection_->codeChunks.erase(currentLabel);
+                        }
 
-                    if (cmd.arguments.size() > 1) {
-                        offset = std::stoull(cmd.arguments[1]);
-                    }
+                        std::string baseLabelName = cmd.arguments[0];
+                        size_t offset = 0;
 
-                    std::cout << "[DEBUG] Processing label: " << baseLabelName;
-                    if (offset > 0) {
-                        std::cout << " + 0x" << std::hex << offset;
-                    }
-                    std::cout << std::dec << std::endl;
+                        if (cmd.arguments.size() > 1) {
+                            offset = std::stoull(cmd.arguments[1]);
+                        }
 
-                    // 尝试解析基址
-                    AddressType baseAddr = 0;
-                    bool resolved = false;
-
-                    // 1. 从符号管理器查找
-                    auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
-                    if (resolvedAddr) {
-                        baseAddr = *resolvedAddr;
-                        resolved = true;
-                        std::cout << "[DEBUG] Resolved from symbols: 0x" << std::hex << baseAddr << std::dec << std::endl;
-                    }
-                    // 2. 从section数据查找
-                    else if (currentSection_->labels.count(baseLabelName)) {
-                        baseAddr = currentSection_->labels[baseLabelName];
-                        resolved = true;
-                        std::cout << "[DEBUG] Found in section labels: 0x" << std::hex << baseAddr << std::dec << std::endl;
-                    }
-                    else if (currentSection_->allocations.count(baseLabelName)) {
-                        baseAddr = currentSection_->allocations[baseLabelName];
-                        resolved = true;
-                        std::cout << "[DEBUG] Found in allocations: 0x" << std::hex << baseAddr << std::dec << std::endl;
-                    }
-
-                    if (resolved) {
-                        // 有明确基址的标签
-                        currentWriteAddress = baseAddr + offset;
-                        currentBaseAddress = baseAddr;  // 记录基址
-
+                        std::cout << "[DEBUG] Processing label: " << baseLabelName;
                         if (offset > 0) {
-                            currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
+                            std::cout << " + 0x" << std::hex << offset;
                         }
-                        else {
-                            currentLabel = baseLabelName;
+                        std::cout << std::dec << std::endl;
+
+                        // Try to resolve base address
+                        AddressType baseAddr = 0;
+                        bool resolved = false;
+
+                        auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
+                        if (resolvedAddr) {
+                            baseAddr = *resolvedAddr;
+                            resolved = true;
+                            std::cout << "[DEBUG] Resolved from symbols: 0x" << std::hex << baseAddr << std::dec << std::endl;
+                        }
+                        else if (currentSection_->allocations.count(baseLabelName)) {
+                            baseAddr = currentSection_->allocations[baseLabelName];
+                            resolved = true;
+                            std::cout << "[DEBUG] Found in allocations: 0x" << std::hex << baseAddr << std::dec << std::endl;
                         }
 
-                        currentSection_->labels[currentLabel] = currentWriteAddress;
-                        engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
-                        hasValidLabel = true;
+                        if (resolved) {
+                            currentWriteAddress = baseAddr + offset;
+                            currentBaseAddress = baseAddr;
 
-                        std::cout << "[DEBUG] Current label: " << currentLabel
-                            << " at 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
-                    }
-                    else {
-                        // 内部标签（如 code, return, health 等）
-                        // 这些标签的地址取决于它们在代码中的位置
-
-                        if (hasValidLabel && currentWriteAddress > 0) {
-                            // 如果当前有有效地址，这个标签继承当前地址
                             if (offset > 0) {
                                 currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
-                                currentWriteAddress = currentBaseAddress + offset;
                             }
                             else {
                                 currentLabel = baseLabelName;
-                                // currentWriteAddress 保持不变，继续从当前位置
                             }
 
                             currentSection_->labels[currentLabel] = currentWriteAddress;
                             engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
+                            hasValidLabel = true;
 
-                            std::cout << "[DEBUG] Internal label '" << currentLabel
-                                << "' at current position: 0x"
-                                << std::hex << currentWriteAddress << std::dec << std::endl;
+                            std::cout << "[DEBUG] Current label: " << currentLabel
+                                << " at 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
                         }
                         else {
-                            // 没有当前地址，标记为待定
-                            currentLabel = baseLabelName;
-                            hasValidLabel = false;
-                            std::cout << "[WARNING] Label '" << baseLabelName
-                                << "' has no context, marked as pending" << std::endl;
+                            // Internal label - check if it was pre-resolved
+                            if (preresolvedLabels.count(baseLabelName)) {
+                                currentWriteAddress = preresolvedLabels[baseLabelName];
+                                currentLabel = baseLabelName;
+                                hasValidLabel = true;
+                                std::cout << "[DEBUG] Using pre-resolved address for '" << baseLabelName
+                                    << "': 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
+                            }
+                            else {
+                                currentLabel = baseLabelName;
+                                hasValidLabel = false;
+                                std::cout << "[WARNING] Label '" << baseLabelName
+                                    << "' has no context" << std::endl;
+                            }
                         }
                     }
-                }
-                break;
+                    break;
 
                 case CommandType::Asm:
                     if (hasValidLabel && currentWriteAddress > 0) {
-                        // 处理汇编指令
+                        // Handle assembly instruction
                         if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
                             int count = std::stoi(cmd.arguments[0]);
                             std::vector<uint8_t> nops(count, 0x90);
@@ -716,7 +807,7 @@ namespace AsmEngine {
                             currentWriteAddress += count;
                         }
                         else {
-                            // 构建汇编指令
+                            // Build assembly instruction
                             std::string asmLine = cmd.name;
                             for (const auto& arg : cmd.arguments) {
                                 asmLine += " " + arg;
@@ -750,72 +841,12 @@ namespace AsmEngine {
                             }
                         }
                     }
-                    else if (!currentLabel.empty()) {
-                        // 如果当前标签无效，但之前有 newmem 这样的基址
-                        // 尝试使用最近的有效基址
-                        if (currentBaseAddress > 0) {
-                            // 为待定标签分配地址
-                            currentWriteAddress = currentBaseAddress + currentSection_->codeChunks[currentLabel].size();
-                            currentSection_->labels[currentLabel] = currentWriteAddress;
-                            engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
-                            hasValidLabel = true;
-
-                            std::cout << "[DEBUG] Assigned address to pending label '" << currentLabel
-                                << "': 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
-
-                            // 重试汇编
-                            std::string asmLine = cmd.name;
-                            for (const auto& arg : cmd.arguments) {
-                                asmLine += " " + arg;
-                            }
-
-                            auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentWriteAddress);
-                            if (result && !result->empty()) {
-                                currentSection_->codeChunks[currentLabel].insert(
-                                    currentSection_->codeChunks[currentLabel].end(),
-                                    result->begin(), result->end()
-                                );
-                                currentWriteAddress += result->size();
-                            }
-                        }
-                        else {
-                            std::cout << "[WARNING] No valid context for assembly: " << cmd.name << std::endl;
-                        }
-                    }
                     break;
 
                 case CommandType::Db:
                 case CommandType::Dd:
                 case CommandType::Dq:
-                    if (hasValidLabel && currentWriteAddress > 0) {
-                        HandleDataDefinition(cmd);
-
-                        // 更新地址
-                        size_t dataSize = 0;
-                        if (cmd.type == CommandType::Db) {
-                            for (const auto& arg : cmd.arguments) {
-                                if (engine_->Captures()->Exists(arg)) {
-                                    auto capture = engine_->Captures()->Get(arg);
-                                    if (capture) {
-                                        dataSize += capture->data.size();
-                                    }
-                                }
-                                else {
-                                    dataSize += 1;
-                                }
-                            }
-                        }
-                        else if (cmd.type == CommandType::Dd) {
-                            dataSize = cmd.arguments.size() * 4;
-                        }
-                        else if (cmd.type == CommandType::Dq) {
-                            dataSize = cmd.arguments.size() * 8;
-                        }
-
-                        currentWriteAddress += dataSize;
-                        std::cout << "[DEBUG] Data added " << dataSize << " bytes, new address: 0x"
-                            << std::hex << currentWriteAddress << std::dec << std::endl;
-                    }
+                    // Skip data definitions - they're handled during label processing
                     break;
 
                 default:
@@ -827,25 +858,12 @@ namespace AsmEngine {
             }
         }
 
-        // 清理最后一个标签（如果为空）
+        // Clean up last label if empty
         if (!currentLabel.empty() &&
             currentSection_->codeChunks.count(currentLabel) > 0 &&
             currentSection_->codeChunks[currentLabel].empty()) {
             std::cout << "[DEBUG] Removing empty code chunk for last label: " << currentLabel << std::endl;
             currentSection_->codeChunks.erase(currentLabel);
-        }
-
-        // ============ 清理所有空的 code chunks ============
-        std::cout << "[DEBUG] Cleaning up empty code chunks..." << std::endl;
-        auto it = currentSection_->codeChunks.begin();
-        while (it != currentSection_->codeChunks.end()) {
-            if (it->second.empty()) {
-                std::cout << "[DEBUG] Removing empty code chunk: " << it->first << std::endl;
-                it = currentSection_->codeChunks.erase(it);
-            }
-            else {
-                ++it;
-            }
         }
 
         // ============ 第3遍：写入内存 ============
@@ -1014,7 +1032,19 @@ namespace AsmEngine {
     }
 
     void ScriptParser::HandleLabel(const ParsedCommand& cmd) {
-        // Label handling is done in ExecuteSection
+        if (cmd.arguments.empty()) {
+            throw EngineException(ErrorCode::InvalidParameter,
+                "label command requires a name");
+        }
+
+        std::string labelName = cmd.arguments[0];
+
+        // For label() command, just mark it as a forward declaration
+        // The actual address will be determined when we see labelname:
+        std::cout << "[DEBUG] Forward declaration of label: " << labelName << std::endl;
+
+        // We don't register it yet - just note that it exists
+        // The actual registration happens when we process "labelname:" later
     }
 
     void ScriptParser::HandleRegisterSymbol(const ParsedCommand& cmd) {
@@ -1316,6 +1346,136 @@ namespace AsmEngine {
             }
             else {
                 std::cout << "[ERROR] No base address found for label: " << label << std::endl;
+            }
+        }
+    }
+
+    void ScriptParser::PreResolveLabels() {
+        std::cout << "[DEBUG] Pre-resolving all labels..." << std::endl;
+
+        if (!currentSection_) return;
+
+        // First pass: Find all label declarations and their eventual addresses
+        std::map<std::string, AddressType> prelabelMap;
+
+        // Scan through all commands looking for patterns like:
+        // newmem+offset:
+        // labelname:
+        for (size_t i = 0; i < currentSection_->commands.size(); i++) {
+            const auto& cmd = currentSection_->commands[i];
+
+            if (cmd.type == CommandType::Label) {
+                std::string baseLabelName = cmd.arguments[0];
+                size_t offset = 0;
+
+                if (cmd.arguments.size() > 1) {
+                    offset = std::stoull(cmd.arguments[1]);
+                }
+
+                // Try to resolve base address
+                AddressType baseAddr = 0;
+                bool hasBase = false;
+
+                auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
+                if (resolvedAddr) {
+                    baseAddr = *resolvedAddr;
+                    hasBase = true;
+                }
+                else if (currentSection_->allocations.count(baseLabelName)) {
+                    baseAddr = currentSection_->allocations[baseLabelName];
+                    hasBase = true;
+                }
+
+                if (hasBase) {
+                    AddressType labelAddr = baseAddr + offset;
+
+                    // Look ahead for immediate following labels
+                    for (size_t j = i + 1; j < currentSection_->commands.size(); j++) {
+                        const auto& nextCmd = currentSection_->commands[j];
+
+                        // Stop if we hit another offset label
+                        if (nextCmd.type == CommandType::Label && nextCmd.arguments.size() > 1) {
+                            break;
+                        }
+
+                        // If it's a simple label, register it at current address
+                        if (nextCmd.type == CommandType::Label && nextCmd.arguments.size() == 1) {
+                            std::string sublabel = nextCmd.arguments[0];
+                            prelabelMap[sublabel] = labelAddr;
+
+                            // Advance address based on next data command
+                            if (j + 1 < currentSection_->commands.size()) {
+                                const auto& dataCmd = currentSection_->commands[j + 1];
+                                if (dataCmd.type == CommandType::Dd) {
+                                    labelAddr += 4 * dataCmd.arguments.size();
+                                }
+                                else if (dataCmd.type == CommandType::Dq) {
+                                    labelAddr += 8 * dataCmd.arguments.size();
+                                }
+                                else if (dataCmd.type == CommandType::Db) {
+                                    labelAddr += dataCmd.arguments.size();
+                                }
+                            }
+                        }
+                        else if (nextCmd.type == CommandType::Dd ||
+                            nextCmd.type == CommandType::Dq ||
+                            nextCmd.type == CommandType::Db) {
+                            // Skip data definitions
+                            continue;
+                        }
+                        else {
+                            // Any other command type, stop scanning
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Register all pre-resolved labels
+        for (const auto& [label, addr] : prelabelMap) {
+            engine_->Symbols()->RegisterSymbol(label, addr);
+            currentSection_->labels[label] = addr;
+            std::cout << "[DEBUG] Pre-resolved label '" << label
+                << "' to 0x" << std::hex << addr << std::dec << std::endl;
+        }
+    }
+    void ScriptParser::ResolveForwardReferences() {
+        // For CE scripts, we need to handle forward references
+        // Labels declared with label() may be defined later in the script
+
+        std::cout << "[DEBUG] Resolving forward references..." << std::endl;
+
+        // First, find all label declarations
+        std::set<std::string> declaredLabels;
+        std::map<std::string, AddressType> definedLabels;
+
+        for (const auto& section : sections_) {
+            for (const auto& cmd : section.commands) {
+                if (cmd.type == CommandType::Label && cmd.name == "label" && !cmd.arguments.empty()) {
+                    // This is a label() declaration
+                    declaredLabels.insert(cmd.arguments[0]);
+                    std::cout << "[DEBUG] Found label declaration: " << cmd.arguments[0] << std::endl;
+                }
+            }
+
+            // Also check section labels
+            for (const auto& [label, addr] : section.labels) {
+                definedLabels[label] = addr;
+            }
+        }
+
+        // For labels that are declared but not yet defined, we need to find where they appear
+        // In CE scripts, labels often appear at specific offsets like newmem+400
+        for (const auto& labelName : declaredLabels) {
+            if (definedLabels.find(labelName) == definedLabels.end()) {
+                // This label is declared but not yet defined
+                // It might be defined later as part of data sections
+
+                // For now, register it as a placeholder
+                // The actual address will be determined during assembly
+                std::cout << "[DEBUG] Forward reference label '" << labelName
+                    << "' will be resolved during assembly" << std::endl;
             }
         }
     }
