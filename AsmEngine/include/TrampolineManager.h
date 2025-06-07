@@ -1,93 +1,120 @@
 #pragma once
 
 #include "Common.h"
-#include "MemoryManager.h"
-#include <mutex>
-#include <vector>
 #include <map>
+#include <memory>
+#include <optional>
+#include <vector>
+#include <string>
 
 namespace AsmEngine {
 
-    // 跳转表项
-    struct JumpTableEntry {
-        AddressType entryAddress;      // 在跳转表中的地址
-        AddressType targetAddress;     // 目标地址（低位地址）
-        bool inUse;
-        std::string description;       // 描述信息
-    };
+    // Forward declaration
+    class MemoryManager;
+    class AssemblyEngine;
 
-    // 跳转表
-    struct JumpTable {
-        AddressType baseAddress;       // 跳转表基址（高位地址）
-        size_t capacity;              // 容量（可容纳的跳转项数）
-        size_t used;                  // 已使用的跳转项数
-        std::vector<JumpTableEntry> entries;
-    };
-
-    // Hook信息
+    // Hook entry information
     struct HookEntry {
-        AddressType originalAddress;   // 原始地址（被hook的地址）
-        AddressType jumpTableEntry;    // 跳转表项地址
-        AddressType hookCodeAddress;   // 实际hook代码地址
-        ByteVector originalBytes;      // 原始字节
-        size_t hookSize;              // hook大小（通常是5字节）
+        AddressType targetAddress;      // Original function address
+        AddressType trampolineAddress;  // Trampoline allocation
+        AddressType hookFunction;       // Hook function address
+        ByteVector originalBytes;       // Original bytes backed up
+        size_t preserveSize;           // Size of preserved instructions
+        std::string description;       // Optional description
+    };
+
+    // Hook information for external use
+    struct HookInfo {
+        AddressType targetAddress;
+        AddressType trampolineAddress;
+        AddressType hookFunction;
+        bool isActive;
+        std::string description;
     };
 
     class TrampolineManager {
     private:
         MemoryManager* memoryManager_;
+        AssemblyEngine* assemblyEngine_;
         mutable std::mutex mutex_;
 
-        // 跳转表管理
-        std::map<AddressType, JumpTable> jumpTables_;  // key是需要hook的地址范围
+        // Minimum size for trampoline
+        static constexpr size_t kMinTrampolineSize = 5;  // Minimum for JMP
 
-        // Hook管理
-        std::map<AddressType, HookEntry> hooks_;       // key是原始地址
+        // Active hooks
+        std::map<AddressType, HookEntry> hooks_;
 
-        // 配置
-        size_t jumpTableEntrySize_ = 14;  // 每个跳转表项的大小（FF 25 + 8字节地址）
-        size_t jumpTableCapacity_ = 256;   // 每个跳转表的默认容量
+        // Trampoline pools for efficient allocation
+        struct TrampolinePool {
+            AddressType baseAddress;
+            size_t totalSize;
+            size_t usedSize;
+            std::vector<std::pair<size_t, size_t>> freeBlocks; // offset, size
+        };
 
-        // 寻找或创建适合的跳转表
-        AddressType FindOrCreateJumpTable(AddressType nearAddress);
+        std::vector<TrampolinePool> pools_;
 
-        // 在跳转表中分配一个条目
-        std::optional<AddressType> AllocateJumpTableEntry(AddressType jumpTableBase,
-            AddressType targetAddress);
+        // Calculate how many bytes to preserve from the original function
+        size_t CalculatePreserveSize(AddressType address) const;
 
-        // 生成跳转表项代码
-        ByteVector GenerateJumpTableEntry(AddressType targetAddress);
+        // Allocate space for a trampoline
+        AddressType AllocateTrampoline(size_t size, AddressType nearAddress);
 
-        // 尝试在指定范围内分配内存
-        AddressType AllocateNearMemory(AddressType nearAddress, size_t size,
-            int64_t maxDistance = 0x7FFFFFFF);
+        // Free a trampoline allocation
+        void FreeTrampoline(AddressType address, size_t size);
+
+        // Build the trampoline code
+        ByteVector BuildTrampoline(AddressType originalAddress,
+            const ByteVector& preservedBytes,
+            AddressType returnAddress);
+
+        // Find hook by address
+        std::optional<HookEntry> FindHook(AddressType address) const;
+
+        // Disassemble instructions to find safe hook point
+        size_t FindSafeHookPoint(AddressType address, size_t minSize) const;
+
+        // Relocate instructions for the trampoline
+        ByteVector RelocateInstructions(AddressType from, AddressType to,
+            const ByteVector& instructions) const;
 
     public:
-        TrampolineManager(MemoryManager* memoryManager);
+        TrampolineManager(MemoryManager* memoryManager, AssemblyEngine* assemblyEngine);
         ~TrampolineManager();
 
-        // 创建Hook
-        bool CreateHook(AddressType originalAddress,     // 要hook的地址
-            AddressType hookCodeAddress,       // hook代码地址
+        // Install a hook with automatic trampoline creation
+        bool InstallHook(AddressType targetAddress, AddressType hookFunction,
             const std::string& description = "");
 
-        // 移除Hook
-        bool RemoveHook(AddressType originalAddress);
+        // Remove a hook
+        bool RemoveHook(AddressType targetAddress);
 
-        // 获取Hook信息
-        std::optional<HookEntry> GetHookInfo(AddressType address) const;
+        // Remove all hooks
+        void RemoveAllHooks();
 
-        // 获取所有活动的Hook
-        std::vector<HookEntry> GetAllHooks() const;
+        // Check if address is hooked
+        bool IsHooked(AddressType address) const;
 
-        // 清理所有Hook和跳转表
-        void Cleanup();
+        // Get hook information
+        std::optional<HookInfo> GetHookInfo(AddressType address) const;
 
-        // 设置跳转表容量
-        void SetJumpTableCapacity(size_t capacity) { jumpTableCapacity_ = capacity; }
+        // Get all active hooks
+        std::vector<HookInfo> GetAllHooks() const;
 
-        // 获取跳转表信息
-        std::vector<JumpTable> GetJumpTables() const;
+        // Create a detour (hook with custom code)
+        bool CreateDetour(AddressType targetAddress, const std::string& detourCode,
+            AddressType& trampolineOut);
+
+        // Enable/disable hook temporarily
+        bool EnableHook(AddressType address);
+        bool DisableHook(AddressType address);
+
+        // Get trampoline address for a hooked function
+        std::optional<AddressType> GetTrampoline(AddressType hookedAddress) const;
+
+        // Pool management
+        void CreatePool(AddressType nearAddress, size_t poolSize);
+        void CleanupPools();
     };
 
 } // namespace AsmEngine

@@ -2,6 +2,11 @@
 
 #include "Common.h"
 #include <map>
+#include <set>
+#include <string>
+#include <vector>
+#include <optional>
+#include <functional>
 
 namespace AsmEngine {
 
@@ -40,6 +45,7 @@ namespace AsmEngine {
         Include,
         Define
     };
+
     struct AssemblyBlock {
         std::string code;
         std::set<std::string> localLabels;
@@ -124,6 +130,23 @@ namespace AsmEngine {
         void PreResolveLabels();
         void ResolveForwardReferences();
 
+        // Script execution helpers
+        void ProcessAllocationsAndScans();
+        void BuildAssemblyBlocks(std::map<std::string, AssemblyBlock>& blocks);
+        std::string BuildAssemblyLine(const ParsedCommand& cmd);
+        std::string BuildDataDirective(const ParsedCommand& cmd);
+        AddressType ResolveBaseAddress(const std::string& label);
+        void ProcessCleanup();
+
+        // Helper method to fix memory offset formatting
+        std::string FixMemoryOffsets(const std::string& line) const;
+
+        // Error callback
+        using ErrorCallback = std::function<void(const std::string&, size_t)>;
+        ErrorCallback errorCallback_;
+
+        void ReportError(const std::string& message, size_t lineNumber);
+
     public:
         ScriptParser(AsmEngine* engine);
         ~ScriptParser() = default;
@@ -152,13 +175,7 @@ namespace AsmEngine {
         void Clear();
 
         // Error handling
-        using ErrorCallback = std::function<void(const std::string&, size_t)>;
         void SetErrorCallback(ErrorCallback callback);
-
-    private:
-        ErrorCallback errorCallback_;
-        std::string FixMemoryOffsets(const std::string& line) const;
-        void ReportError(const std::string& message, size_t lineNumber);
     };
 
     // Script execution context

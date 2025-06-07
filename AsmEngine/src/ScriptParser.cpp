@@ -885,45 +885,216 @@ namespace AsmEngine {
         return result;
     }
 
-    // Helper method to fix memory offset formatting
-    std::string ScriptParser::FixMemoryOffsets(const std::string& line) const {
-        std::string fixed = line;
+    // Add these method implementations to ScriptParser.cpp
 
-        // Fix patterns like [reg+XX] or [reg-XX] to add 0x prefix
-        std::regex offsetRegex(R"(\[([a-zA-Z0-9]+)([+-])([0-9A-Fa-f]+)\])");
-        std::smatch match;
+    void ScriptParser::ProcessAllocationsAndScans() {
+        if (!currentSection_) return;
 
-        std::string result;
-        std::string temp = fixed;
+        for (size_t i = 0; i < currentSection_->commands.size(); ++i) {
+            const ParsedCommand& cmd = currentSection_->commands[i];
+            try {
+                switch (cmd.type) {
+                case CommandType::Aobscan:
+                    HandleAobscan(cmd);
+                    break;
 
-        while (std::regex_search(temp, match, offsetRegex)) {
-            result += temp.substr(0, match.position());
+                case CommandType::Aobscanmodule:
+                    HandleAobscanmodule(cmd);
+                    break;
 
-            std::string reg = match[1].str();
-            std::string sign = match[2].str();
-            std::string offset = match[3].str();
+                case CommandType::Alloc:
+                    HandleAlloc(cmd);
+                    break;
 
-            // Add 0x prefix if not present and it looks like hex
-            if (offset.substr(0, 2) != "0x" && offset.substr(0, 2) != "0X") {
-                // Check if it contains hex digits
-                bool hasHexDigit = false;
-                for (char c : offset) {
-                    if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
-                        hasHexDigit = true;
-                        break;
+                case CommandType::RegisterSymbol:
+                    HandleRegisterSymbol(cmd);
+                    break;
+
+                case CommandType::Define:
+                    HandleDefine(cmd);
+                    break;
+
+                default:
+                    break;
+                }
+            }
+            catch (const std::exception& e) {
+                ReportError(e.what(), cmd.lineNumber);
+            }
+        }
+    }
+
+    void ScriptParser::BuildAssemblyBlocks(std::map<std::string, AssemblyBlock>& blocks) {
+        if (!currentSection_) return;
+
+        std::string currentLabel;
+        std::stringstream currentCode;
+        std::set<std::string> localLabels;
+
+        for (size_t i = 0; i < currentSection_->commands.size(); ++i) {
+            const ParsedCommand& cmd = currentSection_->commands[i];
+
+            // Handle label definitions
+            if (cmd.type == CommandType::Label && cmd.name != "label") {
+                // Save previous block
+                if (!currentLabel.empty() && !currentCode.str().empty()) {
+                    AssemblyBlock block;
+                    block.code = currentCode.str();
+                    block.localLabels = localLabels;
+                    blocks[currentLabel] = block;
+                }
+
+                // Start new block
+                currentLabel = cmd.arguments[0];
+                if (cmd.arguments.size() > 1) {
+                    // Label with offset (e.g., newmem+200)
+                    size_t offset = std::stoull(cmd.arguments[1]);
+                    if (offset > 0) {
+                        currentLabel += "_offset_" + std::to_string(offset);
                     }
                 }
 
-                // For offsets in assembly, always use hex
-                offset = "0x" + offset;
+                currentCode.str("");
+                currentCode.clear();
+                localLabels.clear();
+
+                std::cout << "[DEBUG] Starting assembly block: " << currentLabel << std::endl;
             }
-
-            result += "[" + reg + sign + offset + "]";
-            temp = match.suffix();
+            // Handle label declarations
+            else if (cmd.type == CommandType::Label && cmd.name == "label") {
+                // Forward declaration - add to local labels
+                if (!cmd.arguments.empty()) {
+                    localLabels.insert(cmd.arguments[0]);
+                }
+            }
+            // Handle assembly instructions
+            else if (cmd.type == CommandType::Asm && !currentLabel.empty()) {
+                std::string asmLine = BuildAssemblyLine(cmd);
+                if (!asmLine.empty()) {
+                    currentCode << asmLine << "\n";
+                }
+            }
+            // Handle data definitions
+            else if ((cmd.type == CommandType::Db || cmd.type == CommandType::Dd ||
+                cmd.type == CommandType::Dq || cmd.type == CommandType::Dw) &&
+                !currentLabel.empty()) {
+                std::string dataLine = BuildDataDirective(cmd);
+                if (!dataLine.empty()) {
+                    currentCode << dataLine << "\n";
+                }
+            }
         }
-        result += temp;
 
-        return result;
+        // Save last block
+        if (!currentLabel.empty() && !currentCode.str().empty()) {
+            AssemblyBlock block;
+            block.code = currentCode.str();
+            block.localLabels = localLabels;
+            blocks[currentLabel] = block;
+        }
+    }
+
+    std::string ScriptParser::BuildAssemblyLine(const ParsedCommand& cmd) {
+        // Special handling for "nop X" syntax
+        if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
+            return "nop " + cmd.arguments[0];
+        }
+
+        // Build regular assembly line
+        std::string line = cmd.name;
+        for (size_t i = 0; i < cmd.arguments.size(); ++i) {
+            if (i > 0) line += ",";
+            line += " " + cmd.arguments[i];
+        }
+
+        return line;
+    }
+
+    std::string ScriptParser::BuildDataDirective(const ParsedCommand& cmd) {
+        std::stringstream result;
+
+        // Convert CE data directives to assembly format
+        result << cmd.name;
+
+        for (size_t i = 0; i < cmd.arguments.size(); ++i) {
+            if (i > 0) result << ",";
+            result << " ";
+
+            // Check if it's a capture reference
+            if (engine_->Captures()->Exists(cmd.arguments[i])) {
+                auto capture = engine_->Captures()->Get(cmd.arguments[i]);
+                if (capture) {
+                    // For data directives, use the raw value
+                    switch (cmd.type) {
+                    case CommandType::Db:
+                        result << "0x" << std::hex << static_cast<int>(capture->AsUInt8());
+                        break;
+                    case CommandType::Dw:
+                        result << "0x" << std::hex << capture->AsUInt16();
+                        break;
+                    case CommandType::Dd:
+                        result << "0x" << std::hex << capture->AsUInt32();
+                        break;
+                    case CommandType::Dq:
+                        result << "0x" << std::hex << capture->AsUInt64();
+                        break;
+                    }
+                }
+            }
+            else {
+                // Use the value as-is (will be parsed by AssemblyEngine)
+                result << cmd.arguments[i];
+            }
+        }
+
+        return result.str();
+    }
+
+    AddressType ScriptParser::ResolveBaseAddress(const std::string& label) {
+        // Remove any offset suffix for base lookup
+        std::string baseName = label;
+        size_t offsetPos = label.find("_offset_");
+        size_t offset = 0;
+
+        if (offsetPos != std::string::npos) {
+            baseName = label.substr(0, offsetPos);
+            std::string offsetStr = label.substr(offsetPos + 8);
+            offset = std::stoull(offsetStr);
+        }
+
+        // Check allocations
+        if (currentSection_ && currentSection_->allocations.count(baseName)) {
+            return currentSection_->allocations[baseName] + offset;
+        }
+
+        // Check symbols
+        if (engine_) {
+            auto addr = engine_->Symbols()->ResolveAddress(baseName);
+            if (addr) {
+                return *addr + offset;
+            }
+        }
+
+        return 0;
+    }
+
+    void ScriptParser::ProcessCleanup() {
+        if (!currentSection_) return;
+
+        for (size_t i = 0; i < currentSection_->commands.size(); ++i) {
+            const ParsedCommand& cmd = currentSection_->commands[i];
+            try {
+                if (cmd.type == CommandType::Dealloc) {
+                    HandleDealloc(cmd);
+                }
+                else if (cmd.type == CommandType::UnregisterSymbol) {
+                    HandleUnregisterSymbol(cmd);
+                }
+            }
+            catch (const std::exception& e) {
+                ReportError(e.what(), cmd.lineNumber);
+            }
+        }
     }
 
     void ScriptParser::HandleAobscan(const ParsedCommand& cmd) {
