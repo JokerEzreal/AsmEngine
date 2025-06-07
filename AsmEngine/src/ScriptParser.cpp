@@ -621,6 +621,7 @@ namespace AsmEngine {
         for (size_t i = 0; i < sectionIt->commands.size(); i++) {
             const auto& cmd = sectionIt->commands[i];
 
+            // Look for label definitions (not label() declarations)
             if (cmd.type == CommandType::Label && cmd.name != "label") {
                 std::string baseLabelName = cmd.arguments[0];
                 size_t offset = 0;
@@ -709,77 +710,82 @@ namespace AsmEngine {
             const auto& cmd = sectionIt->commands[cmdIndex];
 
             try {
-                switch (cmd.type) {
-                case CommandType::Label:
-                    // Skip label() declarations
-                    if (cmd.name == "label") {
-                        continue;
+                // Handle label definitions (not declarations)
+                if (cmd.type == CommandType::Label && cmd.name != "label") {
+                    // Clean up previous empty label
+                    if (!currentLabel.empty() &&
+                        currentSection_->codeChunks.count(currentLabel) > 0 &&
+                        currentSection_->codeChunks[currentLabel].empty()) {
+                        std::cout << "[DEBUG] Removing empty code chunk for label: " << currentLabel << std::endl;
+                        currentSection_->codeChunks.erase(currentLabel);
                     }
 
-                    {
-                        // Clean up previous empty label
-                        if (!currentLabel.empty() &&
-                            currentSection_->codeChunks.count(currentLabel) > 0 &&
-                            currentSection_->codeChunks[currentLabel].empty()) {
-                            std::cout << "[DEBUG] Removing empty code chunk for label: " << currentLabel << std::endl;
-                            currentSection_->codeChunks.erase(currentLabel);
-                        }
+                    std::string baseLabelName = cmd.arguments[0];
+                    size_t offset = 0;
 
-                        std::string baseLabelName = cmd.arguments[0];
-                        size_t offset = 0;
+                    if (cmd.arguments.size() > 1) {
+                        offset = std::stoull(cmd.arguments[1]);
+                    }
 
-                        if (cmd.arguments.size() > 1) {
-                            offset = std::stoull(cmd.arguments[1]);
-                        }
+                    std::cout << "[DEBUG] Processing label: " << baseLabelName;
+                    if (offset > 0) {
+                        std::cout << " + 0x" << std::hex << offset;
+                    }
+                    std::cout << std::dec << std::endl;
 
-                        std::cout << "[DEBUG] Processing label: " << baseLabelName;
+                    // Try to resolve base address
+                    AddressType baseAddr = 0;
+                    bool resolved = false;
+
+                    auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
+                    if (resolvedAddr) {
+                        baseAddr = *resolvedAddr;
+                        resolved = true;
+                        std::cout << "[DEBUG] Resolved from symbols: 0x" << std::hex << baseAddr << std::dec << std::endl;
+                    }
+                    else if (currentSection_->allocations.count(baseLabelName)) {
+                        baseAddr = currentSection_->allocations[baseLabelName];
+                        resolved = true;
+                        std::cout << "[DEBUG] Found in allocations: 0x" << std::hex << baseAddr << std::dec << std::endl;
+                    }
+
+                    if (resolved) {
+                        currentWriteAddress = baseAddr + offset;
+                        currentBaseAddress = baseAddr;
+                        currentLabel = baseLabelName;
+
                         if (offset > 0) {
-                            std::cout << " + 0x" << std::hex << offset;
-                        }
-                        std::cout << std::dec << std::endl;
-
-                        // Try to resolve base address
-                        AddressType baseAddr = 0;
-                        bool resolved = false;
-
-                        auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
-                        if (resolvedAddr) {
-                            baseAddr = *resolvedAddr;
-                            resolved = true;
-                            std::cout << "[DEBUG] Resolved from symbols: 0x" << std::hex << baseAddr << std::dec << std::endl;
-                        }
-                        else if (currentSection_->allocations.count(baseLabelName)) {
-                            baseAddr = currentSection_->allocations[baseLabelName];
-                            resolved = true;
-                            std::cout << "[DEBUG] Found in allocations: 0x" << std::hex << baseAddr << std::dec << std::endl;
+                            currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
                         }
 
-                        if (resolved) {
-                            currentWriteAddress = baseAddr + offset;
-                            currentBaseAddress = baseAddr;
+                        currentSection_->labels[currentLabel] = currentWriteAddress;
+                        engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
+                        hasValidLabel = true;
 
-                            if (offset > 0) {
-                                currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
-                            }
-                            else {
-                                currentLabel = baseLabelName;
-                            }
-
-                            currentSection_->labels[currentLabel] = currentWriteAddress;
-                            engine_->Symbols()->RegisterLabel(currentLabel, currentWriteAddress);
+                        std::cout << "[DEBUG] Current label: " << currentLabel
+                            << " at 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
+                    }
+                    else {
+                        // Internal label - check if it was pre-resolved
+                        if (preresolvedLabels.count(baseLabelName)) {
+                            currentWriteAddress = preresolvedLabels[baseLabelName];
+                            currentLabel = baseLabelName;
                             hasValidLabel = true;
-
-                            std::cout << "[DEBUG] Current label: " << currentLabel
-                                << " at 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
+                            std::cout << "[DEBUG] Using pre-resolved address for '" << baseLabelName
+                                << "': 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
                         }
                         else {
-                            // Internal label - check if it was pre-resolved
-                            if (preresolvedLabels.count(baseLabelName)) {
-                                currentWriteAddress = preresolvedLabels[baseLabelName];
+                            // Check if it's a symbol that was just registered
+                            auto symAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
+                            if (symAddr) {
+                                currentWriteAddress = *symAddr + offset;
                                 currentLabel = baseLabelName;
+                                if (offset > 0) {
+                                    currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
+                                }
                                 hasValidLabel = true;
-                                std::cout << "[DEBUG] Using pre-resolved address for '" << baseLabelName
-                                    << "': 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
+                                std::cout << "[DEBUG] Found registered symbol '" << baseLabelName
+                                    << "' at 0x" << std::hex << *symAddr << std::dec << std::endl;
                             }
                             else {
                                 currentLabel = baseLabelName;
@@ -789,68 +795,74 @@ namespace AsmEngine {
                             }
                         }
                     }
-                    break;
+                }
+                // Skip label() declarations
+                else if (cmd.type == CommandType::Label && cmd.name == "label") {
+                    continue;
+                }
+                // Skip data definitions - they're handled during pre-resolution
+                else if (cmd.type == CommandType::Db ||
+                    cmd.type == CommandType::Dd ||
+                    cmd.type == CommandType::Dq) {
+                    continue;
+                }
+                // Skip certain script commands
+                else if (cmd.type == CommandType::RegisterSymbol ||
+                    cmd.type == CommandType::UnregisterSymbol ||
+                    cmd.type == CommandType::Aobscanmodule ||
+                    cmd.type == CommandType::Alloc ||
+                    cmd.type == CommandType::Dealloc) {
+                    continue;
+                }
+                // Process assembly instructions
+                else if (cmd.type == CommandType::Asm && hasValidLabel && currentWriteAddress > 0) {
+                    // This is an assembly instruction
+                    std::string asmLine = cmd.name;
+                    for (const auto& arg : cmd.arguments) {
+                        asmLine += " " + arg;
+                    }
 
-                case CommandType::Asm:
-                    if (hasValidLabel && currentWriteAddress > 0) {
-                        // Handle assembly instruction
-                        if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
-                            int count = std::stoi(cmd.arguments[0]);
-                            std::vector<uint8_t> nops(count, 0x90);
+                    std::cout << "[DEBUG] Assembling for " << currentLabel
+                        << " at 0x" << std::hex << currentWriteAddress
+                        << ": " << asmLine << std::dec << std::endl;
 
-                            std::cout << "[DEBUG] Adding " << count << " NOPs to " << currentLabel << std::endl;
+                    // Special handling for "nop_multiple"
+                    if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
+                        int count = std::stoi(cmd.arguments[0]);
+                        std::vector<uint8_t> nops(count, 0x90);
+
+                        currentSection_->codeChunks[currentLabel].insert(
+                            currentSection_->codeChunks[currentLabel].end(),
+                            nops.begin(), nops.end()
+                        );
+                        currentWriteAddress += count;
+                    }
+                    else {
+                        // Regular assembly instruction
+                        auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentWriteAddress);
+                        if (result && !result->empty()) {
+                            std::cout << "[DEBUG] Assembled " << result->size() << " bytes: ";
+                            for (size_t i = 0; i < std::min<size_t>(result->size(), 16); ++i) {
+                                std::cout << std::hex << std::setw(2) << std::setfill('0')
+                                    << (int)(*result)[i] << " ";
+                            }
+                            std::cout << std::setfill(' ');  // Reset fill character
+                            if (result->size() > 16) {
+                                std::cout << "...";
+                            }
+                            std::cout << std::dec << std::endl;
 
                             currentSection_->codeChunks[currentLabel].insert(
                                 currentSection_->codeChunks[currentLabel].end(),
-                                nops.begin(), nops.end()
+                                result->begin(), result->end()
                             );
-                            currentWriteAddress += count;
+
+                            currentWriteAddress += result->size();
                         }
                         else {
-                            // Build assembly instruction
-                            std::string asmLine = cmd.name;
-                            for (const auto& arg : cmd.arguments) {
-                                asmLine += " " + arg;
-                            }
-
-                            std::cout << "[DEBUG] Assembling for " << currentLabel
-                                << " at 0x" << std::hex << currentWriteAddress
-                                << ": " << asmLine << std::dec << std::endl;
-
-                            auto result = engine_->Assembly()->AssembleInstruction(asmLine, currentWriteAddress);
-                            if (result && !result->empty()) {
-                                std::cout << "[DEBUG] Assembled " << result->size() << " bytes: ";
-                                for (size_t i = 0; i < std::min<size_t>(result->size(), 16); ++i) {
-                                    std::cout << std::hex << std::setw(2) << std::setfill('0')
-                                        << (int)(*result)[i] << " ";
-                                }
-                                if (result->size() > 16) {
-                                    std::cout << "...";
-                                }
-                                std::cout << std::dec << std::endl;
-
-                                currentSection_->codeChunks[currentLabel].insert(
-                                    currentSection_->codeChunks[currentLabel].end(),
-                                    result->begin(), result->end()
-                                );
-
-                                currentWriteAddress += result->size();
-                            }
-                            else {
-                                std::cout << "[ERROR] Failed to assemble: " << asmLine << std::endl;
-                            }
+                            std::cout << "[ERROR] Failed to assemble: " << asmLine << std::endl;
                         }
                     }
-                    break;
-
-                case CommandType::Db:
-                case CommandType::Dd:
-                case CommandType::Dq:
-                    // Skip data definitions - they're handled during label processing
-                    break;
-
-                default:
-                    break;
                 }
             }
             catch (const std::exception& e) {
