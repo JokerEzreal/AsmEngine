@@ -1,0 +1,21 @@
+import os
+
+def delete_cpp_files_in_subfolders(root_dir):
+    deleted_files = 0
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        if dirpath == root_dir:
+            continue  # 跳过根目录本身
+        for file in filenames:
+            if file.endswith(".cpp"):
+                file_path = os.path.join(dirpath, file)
+                try:
+                    os.remove(file_path)
+                    print(f"Deleted: {file_path}")
+                    deleted_files += 1
+                except Exception as e:
+                    print(f"Failed to delete {file_path}: {e}")
+    print(f"\nTotal .cpp files deleted: {deleted_files}")
+
+if __name__ == "__main__":
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    delete_cpp_files_in_subfolders(current_dir)
