@@ -586,13 +586,9 @@ namespace AsmEngine {
             }
         }
     }
-    // Fixed ExecuteSection method for ScriptParser.cpp
-
     void ScriptParser::ExecuteSection(const std::string& sectionName) {
         auto sectionIt = std::find_if(sections_.begin(), sections_.end(),
-            [&](const ScriptSection& s) {
-                return s.name == sectionName;
-            });
+            [&](const ScriptSection& s) { return s.name == sectionName; });
 
         if (sectionIt == sections_.end()) {
             throw EngineException(ErrorCode::InvalidParameter,
@@ -601,12 +597,62 @@ namespace AsmEngine {
 
         currentSection_ = &(*sectionIt);
 
-        // ============ Pass 1: Process allocations, scans and label declarations ============
-        std::cout << "[DEBUG] Pass 1: Processing allocations, scans and label declarations..." << std::endl;
+        // Pass 1: Process allocations, AOB scans, and symbol registrations
+        std::cout << "[DEBUG] Pass 1: Processing allocations and scans..." << std::endl;
+        ProcessAllocationsAndScans();
 
-        std::set<std::string> declaredLabels;
+        // Pass 2: Build assembly blocks for each code section
+        std::cout << "[DEBUG] Pass 2: Building assembly blocks..." << std::endl;
+        std::map<std::string, AssemblyBlock> assemblyBlocks;
+        BuildAssemblyBlocks(assemblyBlocks);
 
-        for (const auto& cmd : sectionIt->commands) {
+        // Pass 3: Assemble and write code using the refactored AssemblyEngine
+        std::cout << "[DEBUG] Pass 3: Assembling and writing code..." << std::endl;
+        for (const auto& [label, block] : assemblyBlocks) {
+            if (block.code.empty()) continue;
+
+            AddressType baseAddr = ResolveBaseAddress(label);
+            if (baseAddr == 0) {
+                std::cout << "[WARNING] No base address for label: " << label << std::endl;
+                continue;
+            }
+
+            std::cout << "[DEBUG] Assembling block '" << label << "' at 0x"
+                << std::hex << baseAddr << std::dec << std::endl;
+
+            // Use the refactored AssemblyEngine with asmjit
+            auto assembled = engine_->Assembly()->Assemble(block.code, baseAddr);
+            if (assembled) {
+                // Write to memory
+                if (!engine_->Memory()->WriteMemory(baseAddr,
+                    assembled->machineCode.data(),
+                    assembled->machineCode.size())) {
+                    throw EngineException(ErrorCode::MemoryAccessError,
+                        "Failed to write code for label: " + label);
+                }
+
+                std::cout << "[DEBUG] Wrote " << assembled->machineCode.size()
+                    << " bytes for '" << label << "'" << std::endl;
+
+                // Update symbol addresses for any labels defined within this block
+                for (const auto& [sublabel, offset] : assembled->labels) {
+                    engine_->Symbols()->RegisterLabel(sublabel, offset);
+                }
+            }
+            else {
+                std::cerr << "[ERROR] Failed to assemble block: " << label << std::endl;
+            }
+        }
+
+        // Pass 4: Process deallocs and unregister symbols
+        std::cout << "[DEBUG] Pass 4: Cleanup..." << std::endl;
+        ProcessCleanup();
+
+        currentSection_ = nullptr;
+    }
+
+    void ScriptParser::ProcessAllocationsAndScans() {
+        for (const auto& cmd : currentSection_->commands) {
             try {
                 switch (cmd.type) {
                 case CommandType::Aobscan:
@@ -629,13 +675,6 @@ namespace AsmEngine {
                     HandleDefine(cmd);
                     break;
 
-                case CommandType::Label:
-                    if (cmd.name == "label" && !cmd.arguments.empty()) {
-                        declaredLabels.insert(cmd.arguments[0]);
-                        std::cout << "[DEBUG] Declared label: " << cmd.arguments[0] << std::endl;
-                    }
-                    break;
-
                 default:
                     break;
                 }
@@ -644,249 +683,152 @@ namespace AsmEngine {
                 ReportError(e.what(), cmd.lineNumber);
             }
         }
+    }
 
-        // ============ Pass 2: Pre-resolve data labels ============
-        std::cout << "[DEBUG] Pass 2: Pre-resolving data labels..." << std::endl;
+    void ScriptParser::BuildAssemblyBlocks(std::map<std::string, AssemblyBlock>& blocks) {
+        std::string currentLabel;
+        std::stringstream currentCode;
+        std::set<std::string> localLabels;
 
-        std::map<std::string, AddressType> preresolvedLabels;
-
-        for (size_t i = 0; i < sectionIt->commands.size(); i++) {
-            const auto& cmd = sectionIt->commands[i];
-
+        for (const auto& cmd : currentSection_->commands) {
+            // Handle label definitions
             if (cmd.type == CommandType::Label && cmd.name != "label") {
-                std::string baseLabelName = cmd.arguments[0];
-                size_t offset = 0;
+                // Save previous block
+                if (!currentLabel.empty() && !currentCode.str().empty()) {
+                    blocks[currentLabel] = { currentCode.str(), localLabels };
+                }
 
+                // Start new block
+                currentLabel = cmd.arguments[0];
                 if (cmd.arguments.size() > 1) {
-                    offset = std::stoull(cmd.arguments[1]);
-                }
-
-                AddressType baseAddr = 0;
-                bool hasBase = false;
-
-                auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
-                if (resolvedAddr) {
-                    baseAddr = *resolvedAddr;
-                    hasBase = true;
-                }
-                else if (currentSection_->allocations.count(baseLabelName)) {
-                    baseAddr = currentSection_->allocations[baseLabelName];
-                    hasBase = true;
-                }
-
-                if (hasBase) {
-                    AddressType currentAddr = baseAddr + offset;
-
-                    // Look for data labels following this address label
-                    for (size_t j = i + 1; j < sectionIt->commands.size(); j++) {
-                        const auto& nextCmd = sectionIt->commands[j];
-
-                        if (nextCmd.type == CommandType::Label &&
-                            nextCmd.arguments.size() > 1 &&
-                            nextCmd.name != "label") {
-                            break;
-                        }
-
-                        if (nextCmd.type == CommandType::Label &&
-                            nextCmd.arguments.size() == 1 &&
-                            nextCmd.name != "label" &&
-                            nextCmd.arguments[0] != "@@") {  // Skip anonymous labels
-                            std::string sublabel = nextCmd.arguments[0];
-                            preresolvedLabels[sublabel] = currentAddr;
-
-                            // Advance based on following data
-                            if (j + 1 < sectionIt->commands.size()) {
-                                const auto& dataCmd = sectionIt->commands[j + 1];
-                                if (dataCmd.type == CommandType::Dd) {
-                                    currentAddr += 4;
-                                }
-                                else if (dataCmd.type == CommandType::Dq) {
-                                    currentAddr += 8;
-                                }
-                                else if (dataCmd.type == CommandType::Db) {
-                                    currentAddr += dataCmd.arguments.size();
-                                }
-                            }
-                        }
-                        else if (nextCmd.type != CommandType::Dd &&
-                            nextCmd.type != CommandType::Dq &&
-                            nextCmd.type != CommandType::Db) {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Register pre-resolved labels
-        for (const auto& [label, addr] : preresolvedLabels) {
-            engine_->Symbols()->RegisterSymbol(label, addr);
-            currentSection_->labels[label] = addr;
-            std::cout << "[DEBUG] Pre-resolved label '" << label
-                << "' at 0x" << std::hex << addr << std::dec << std::endl;
-        }
-
-        // ============ Pass 3: Build assembly code blocks ============
-        std::cout << "[DEBUG] Pass 3: Building assembly code blocks..." << std::endl;
-
-        struct CodeBlock {
-            std::string label;
-            AddressType address;
-            std::string code;
-            std::map<int, std::string> anonLabels;  // line -> label name
-            int anonCounter = 0;
-        };
-
-        std::vector<CodeBlock> codeBlocks;
-        CodeBlock* currentBlock = nullptr;
-
-        for (size_t cmdIndex = 0; cmdIndex < sectionIt->commands.size(); cmdIndex++) {
-            const auto& cmd = sectionIt->commands[cmdIndex];
-
-            // Handle label definitions with addresses
-            if (cmd.type == CommandType::Label && cmd.name != "label") {
-                std::string baseLabelName = cmd.arguments[0];
-                size_t offset = 0;
-
-                if (cmd.arguments.size() > 1) {
-                    offset = std::stoull(cmd.arguments[1]);
-                }
-
-                // Skip anonymous label definitions for now
-                if (baseLabelName == "@@") {
-                    if (currentBlock) {
-                        currentBlock->anonCounter++;
-                        std::string anonName = "__anon_" + currentBlock->label + "_" +
-                            std::to_string(currentBlock->anonCounter);
-                        currentBlock->code += anonName + ":\n";
-                        currentBlock->anonLabels[currentBlock->anonCounter] = anonName;
-                    }
-                    continue;
-                }
-
-                // Try to resolve base address
-                auto resolvedAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
-                if (resolvedAddr || currentSection_->allocations.count(baseLabelName)) {
-                    AddressType addr = resolvedAddr ? *resolvedAddr : currentSection_->allocations[baseLabelName];
-                    addr += offset;
-
-                    // Start new code block
-                    codeBlocks.push_back({});
-                    currentBlock = &codeBlocks.back();
-                    currentBlock->label = baseLabelName;
+                    // Label with offset (e.g., newmem+200)
+                    size_t offset = std::stoull(cmd.arguments[1]);
                     if (offset > 0) {
-                        currentBlock->label += "_offset_" + std::to_string(offset);
+                        currentLabel += "_offset_" + std::to_string(offset);
                     }
-                    currentBlock->address = addr;
-                    currentBlock->anonCounter = 0;
-
-                    std::cout << "[DEBUG] Starting code block '" << currentBlock->label
-                        << "' at 0x" << std::hex << addr << std::dec << std::endl;
                 }
-                else if (declaredLabels.count(baseLabelName) && currentBlock) {
-                    // This is a code label within current block
-                    currentBlock->code += baseLabelName + ":\n";
+
+                currentCode.str("");
+                currentCode.clear();
+                localLabels.clear();
+
+                std::cout << "[DEBUG] Starting assembly block: " << currentLabel << std::endl;
+            }
+            // Handle label declarations
+            else if (cmd.type == CommandType::Label && cmd.name == "label") {
+                // Forward declaration - add to local labels
+                if (!cmd.arguments.empty()) {
+                    localLabels.insert(cmd.arguments[0]);
                 }
             }
-            // Skip non-assembly commands
-            else if (cmd.type == CommandType::Label ||
-                cmd.type == CommandType::RegisterSymbol ||
-                cmd.type == CommandType::UnregisterSymbol ||
-                cmd.type == CommandType::Aobscanmodule ||
-                cmd.type == CommandType::Alloc ||
-                cmd.type == CommandType::Dealloc ||
-                cmd.type == CommandType::Dd ||
-                cmd.type == CommandType::Dq ||
-                cmd.type == CommandType::Db) {
-                continue;
+            // Handle assembly instructions
+            else if (cmd.type == CommandType::Asm && !currentLabel.empty()) {
+                std::string asmLine = BuildAssemblyLine(cmd);
+                if (!asmLine.empty()) {
+                    currentCode << asmLine << "\n";
+                }
             }
-            // Process assembly instructions
-            else if (cmd.type == CommandType::Asm && currentBlock) {
-                // Build assembly line
-                std::string asmLine = cmd.name;
-                for (const auto& arg : cmd.arguments) {
-                    asmLine += " " + arg;
-                }
-
-                // Fix memory offset formatting
-                asmLine = FixMemoryOffsets(asmLine);
-
-                // Handle anonymous label references
-                if (asmLine.find("@f") != std::string::npos) {
-                    // Replace @f with next anonymous label
-                    std::string replacement = "__anon_" + currentBlock->label + "_" +
-                        std::to_string(currentBlock->anonCounter + 1);
-                    size_t pos = 0;
-                    while ((pos = asmLine.find("@f", pos)) != std::string::npos) {
-                        asmLine.replace(pos, 2, replacement);
-                        pos += replacement.length();
-                    }
-                }
-
-                if (asmLine.find("@b") != std::string::npos) {
-                    // Replace @b with current anonymous label
-                    std::string replacement = "__anon_" + currentBlock->label + "_" +
-                        std::to_string(currentBlock->anonCounter);
-                    size_t pos = 0;
-                    while ((pos = asmLine.find("@b", pos)) != std::string::npos) {
-                        asmLine.replace(pos, 2, replacement);
-                        pos += replacement.length();
-                    }
-                }
-
-                // Handle special nop syntax
-                if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
-                    int count = std::stoi(cmd.arguments[0]);
-                    for (int i = 0; i < count; i++) {
-                        currentBlock->code += "nop\n";
-                    }
-                }
-                else {
-                    currentBlock->code += asmLine + "\n";
+            // Handle data definitions
+            else if ((cmd.type == CommandType::Db || cmd.type == CommandType::Dd ||
+                cmd.type == CommandType::Dq || cmd.type == CommandType::Dw) &&
+                !currentLabel.empty()) {
+                std::string dataLine = BuildDataDirective(cmd);
+                if (!dataLine.empty()) {
+                    currentCode << dataLine << "\n";
                 }
             }
         }
 
-        // ============ Pass 4: Assemble and write code blocks ============
-        std::cout << "[DEBUG] Pass 4: Assembling and writing code blocks..." << std::endl;
+        // Save last block
+        if (!currentLabel.empty() && !currentCode.str().empty()) {
+            blocks[currentLabel] = { currentCode.str(), localLabels };
+        }
+    }
 
-        for (const auto& block : codeBlocks) {
-            if (block.code.empty()) continue;
+    std::string ScriptParser::BuildAssemblyLine(const ParsedCommand& cmd) {
+        // Special handling for "nop X" syntax
+        if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
+            return "nop " + cmd.arguments[0];
+        }
 
-            std::cout << "[DEBUG] Assembling block '" << block.label << "' at 0x"
-                << std::hex << block.address << std::dec << std::endl;
-            std::cout << "[DEBUG] Code:\n" << block.code << std::endl;
+        // Build regular assembly line
+        std::string line = cmd.name;
+        for (size_t i = 0; i < cmd.arguments.size(); ++i) {
+            if (i > 0) line += ",";
+            line += " " + cmd.arguments[i];
+        }
 
-            // Assemble the code block
-            auto assembled = engine_->Assembly()->Assemble(block.code, block.address);
+        return line;
+    }
 
-            if (assembled && !assembled->machineCode.empty()) {
-                currentSection_->codeChunks[block.label] = assembled->machineCode;
+    std::string ScriptParser::BuildDataDirective(const ParsedCommand& cmd) {
+        std::stringstream result;
 
-                std::cout << "[DEBUG] Assembled " << assembled->machineCode.size()
-                    << " bytes successfully" << std::endl;
+        // Convert CE data directives to asmjit format
+        result << cmd.name;
 
-                // Show first few bytes
-                std::cout << "[DEBUG] Bytes: ";
-                for (size_t i = 0; i < std::min<size_t>(assembled->machineCode.size(), 16); ++i) {
-                    std::cout << std::hex << std::setw(2) << std::setfill('0')
-                        << (int)assembled->machineCode[i] << " ";
+        for (size_t i = 0; i < cmd.arguments.size(); ++i) {
+            if (i > 0) result << ",";
+            result << " ";
+
+            // Check if it's a capture reference
+            if (engine_->Captures()->Exists(cmd.arguments[i])) {
+                auto capture = engine_->Captures()->Get(cmd.arguments[i]);
+                if (capture) {
+                    // For data directives, use the raw value
+                    switch (cmd.type) {
+                    case CommandType::Db:
+                        result << "0x" << std::hex << (int)capture->AsUInt8();
+                        break;
+                    case CommandType::Dw:
+                        result << "0x" << std::hex << capture->AsUInt16();
+                        break;
+                    case CommandType::Dd:
+                        result << "0x" << std::hex << capture->AsUInt32();
+                        break;
+                    case CommandType::Dq:
+                        result << "0x" << std::hex << capture->AsUInt64();
+                        break;
+                    }
                 }
-                if (assembled->machineCode.size() > 16) {
-                    std::cout << "...";
-                }
-                std::cout << std::dec << std::endl;
             }
             else {
-                std::cout << "[ERROR] Failed to assemble code block: " << block.label << std::endl;
+                // Use the value as-is (will be parsed by AssemblyEngine)
+                result << cmd.arguments[i];
             }
         }
 
-        // Write to memory
-        WriteCodeToMemory();
+        return result.str();
+    }
 
-        // ============ Pass 5: Cleanup ============
-        for (const auto& cmd : sectionIt->commands) {
+    AddressType ScriptParser::ResolveBaseAddress(const std::string& label) {
+        // Remove any offset suffix for base lookup
+        std::string baseName = label;
+        size_t offsetPos = label.find("_offset_");
+        size_t offset = 0;
+
+        if (offsetPos != std::string::npos) {
+            baseName = label.substr(0, offsetPos);
+            std::string offsetStr = label.substr(offsetPos + 8);
+            offset = std::stoull(offsetStr);
+        }
+
+        // Check allocations
+        if (currentSection_->allocations.count(baseName)) {
+            return currentSection_->allocations[baseName] + offset;
+        }
+
+        // Check symbols
+        auto addr = engine_->Symbols()->ResolveAddress(baseName);
+        if (addr) {
+            return *addr + offset;
+        }
+
+        return 0;
+    }
+
+    void ScriptParser::ProcessCleanup() {
+        for (const auto& cmd : currentSection_->commands) {
             try {
                 if (cmd.type == CommandType::Dealloc) {
                     HandleDealloc(cmd);
@@ -899,9 +841,8 @@ namespace AsmEngine {
                 ReportError(e.what(), cmd.lineNumber);
             }
         }
-
-        currentSection_ = nullptr;
     }
+
 
     // Helper method to fix memory offset formatting
     std::string ScriptParser::FixMemoryOffsets(const std::string& line) const {

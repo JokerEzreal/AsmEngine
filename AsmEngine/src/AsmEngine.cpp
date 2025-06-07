@@ -1,741 +1,1305 @@
-﻿// Enhanced AssemblyEngine.cpp using AsmJit
-#include "AssemblyEngine.h"
+﻿#include "AssemblyEngine.h"
 #include <regex>
 #include <sstream>
 #include <iostream>
-#include <iomanip>
-#include <map>
+#include <algorithm>
+#include <cctype>
 
 namespace AsmEngine {
 
     using namespace asmjit;
+    using namespace asmjit::x86;
 
-    AssemblyEngine::AssemblyEngine(SymbolManager* symbolManager,
-        CaptureStorage* captureStorage)
+    // AssemblyContext implementation
+    AssemblyContext::AssemblyContext(JitRuntime* runtime, AddressType base)
+        : assembler(&code), baseAddress(base) {
+
+        code.init(runtime->environment());
+
+        // Set base address if provided
+        if (base != 0) {
+            code.setBaseAddress(base);
+        }
+    }
+
+    Label AssemblyContext::GetOrCreateLabel(const std::string& name) {
+        auto it = labels.find(name);
+        if (it != labels.end()) {
+            return it->second;
+        }
+
+        Label label = assembler.newLabel();
+        labels[name] = label;
+        return label;
+    }
+
+    void AssemblyContext::BindLabel(const std::string& name) {
+        Label label = GetOrCreateLabel(name);
+        assembler.bind(label);
+
+        // Store resolved address
+        resolvedAddresses[name] = baseAddress + assembler.offset();
+    }
+
+    Imm AssemblyContext::ResolveImmediate(const std::string& value) {
+        // Parse hex, decimal, or symbol
+        if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+            // Hex value
+            uint64_t val = std::stoull(value, nullptr, 16);
+            return imm(val);
+        }
+        else if (std::all_of(value.begin(), value.end(), ::isdigit)) {
+            // Decimal value
+            uint64_t val = std::stoull(value);
+            return imm(val);
+        }
+
+        // Could be a symbol - return 0 for now
+        return imm(0);
+    }
+
+    // AssemblyEngine implementation
+    AssemblyEngine::AssemblyEngine(SymbolManager* symbolManager, CaptureStorage* captureStorage)
         : symbolManager_(symbolManager), captureStorage_(captureStorage) {
 
-        // Initialize AsmJit runtime
         runtime_ = std::make_unique<JitRuntime>();
     }
 
     AssemblyEngine::~AssemblyEngine() = default;
 
-    // Enhanced assembly method that handles labels and multiple instructions
-    std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly,
-        AddressType baseAddress) {
+    std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly, AddressType address) {
+        AssemblyContext ctx(runtime_.get(), address);
 
-        AssembledCode result;
-
-        // Create code holder and assembler
-        CodeHolder code;
-        code.init(runtime_->environment(), baseAddress);
-
-        x86::Assembler assembler(&code);
-
-        // Label management
-        std::map<std::string, Label> labelMap;
-        std::map<std::string, std::vector<size_t>> unresolvedJumps;
-        std::vector<std::pair<size_t, std::string>> jumpFixups;
-
-        // Parse assembly line by line
         std::istringstream stream(assembly);
         std::string line;
+
+        std::cout << "[DEBUG] Starting assembly at address 0x" << std::hex << address << std::dec << std::endl;
 
         while (std::getline(stream, line)) {
             // Trim whitespace
             line.erase(0, line.find_first_not_of(" \t"));
             line.erase(line.find_last_not_of(" \t") + 1);
 
-            // Skip empty lines and comments
-            if (line.empty() || line[0] == ';') {
+            if (line.empty() || line[0] == ';' || (line.size() >= 2 && line[0] == '/' && line[1] == '/')) {
                 continue;
             }
 
-            // Check for labels
+            // Check for label definition
             if (line.back() == ':') {
                 std::string labelName = line.substr(0, line.length() - 1);
+                ctx.BindLabel(labelName);
 
-                // Create or get label
-                if (labelMap.find(labelName) == labelMap.end()) {
-                    labelMap[labelName] = assembler.newLabel();
+                std::cout << "[DEBUG] Bound label '" << labelName << "' at offset "
+                    << ctx.assembler.offset() << std::endl;
+
+                // Register in symbol manager if available
+                if (symbolManager_) {
+                    symbolManager_->RegisterLabel(labelName,
+                        address + ctx.assembler.offset());
                 }
-
-                // Bind label to current position
-                assembler.bind(labelMap[labelName]);
-
-                // Store label address
-                result.labels[labelName] = baseAddress + assembler.offset();
-
                 continue;
             }
 
-            // Preprocess the line
-            std::string processed = PreprocessAssembly(line, baseAddress + assembler.offset());
+            // Preprocess and assemble instruction
+            std::string processed = PreprocessLine(line, ctx);
 
-            // Assemble the instruction
-            if (!AssembleInstructionAsmJit(assembler, processed, labelMap, jumpFixups)) {
-                std::cout << "[ERROR] Failed to assemble: " << line << std::endl;
-                std::cout << "[DEBUG] Processed: " << processed << std::endl;
+            std::cout << "[DEBUG] Assembling: " << processed << std::endl;
+
+            if (!ParseAndAssembleInstruction(ctx, processed)) {
+                std::cerr << "[ERROR] Failed to assemble: " << line << std::endl;
+                return std::nullopt;
             }
         }
 
-        // Finalize the code
-        Error err = code.flatten();
+        // Finalize code
+        Error err = ctx.code.flatten();
         if (err) {
-            std::cout << "[ERROR] Failed to flatten code: " << DebugUtils::errorAsString(err) << std::endl;
+            std::cerr << "[ERROR] Failed to flatten code" << std::endl;
             return std::nullopt;
         }
 
-        err = code.resolveUnresolvedLinks();
+        err = ctx.code.resolveUnresolvedLinks();
         if (err) {
-            std::cout << "[ERROR] Failed to resolve links: " << DebugUtils::errorAsString(err) << std::endl;
+            std::cerr << "[ERROR] Failed to resolve links" << std::endl;
             return std::nullopt;
         }
 
-        // Get the assembled code
-        CodeBuffer& buffer = code.sectionById(0)->buffer();
-        if (buffer.size() == 0) {
-            return std::nullopt;
-        }
-
+        // Extract machine code
+        AssembledCode result;
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
         result.machineCode.assign(buffer.data(), buffer.data() + buffer.size());
         result.codeSize = buffer.size();
+        result.labels = ctx.resolvedAddresses;
+
+        std::cout << "[DEBUG] Assembly complete: " << result.codeSize << " bytes generated" << std::endl;
 
         return result;
     }
 
-    // Enhanced instruction assembler using AsmJit
-    bool AssemblyEngine::AssembleInstructionAsmJit(x86::Assembler& assembler,
-        const std::string& instruction,
-        std::map<std::string, Label>& labelMap,
-        std::vector<std::pair<size_t, std::string>>& jumpFixups) {
-
-        // Parse instruction
+    bool AssemblyEngine::ParseAndAssembleInstruction(AssemblyContext& ctx, const std::string& instruction) {
         std::istringstream iss(instruction);
         std::string mnemonic;
         iss >> mnemonic;
 
-        // Convert to lowercase
+        // Convert to lowercase for comparison
         std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(), ::tolower);
 
-        // Get operands
-        std::string operandsStr;
-        std::getline(iss, operandsStr);
-
-        // Parse operands
+        // Collect operands
         std::vector<std::string> operands;
-        if (!operandsStr.empty()) {
-            operandsStr.erase(0, operandsStr.find_first_not_of(" \t"));
+        std::string operandLine;
+        std::getline(iss, operandLine);
 
-            std::string current;
-            bool inBrackets = false;
+        if (!operandLine.empty()) {
+            // Parse operands considering commas and brackets
+            std::string currentOp;
+            int bracketDepth = 0;
 
-            for (char c : operandsStr) {
-                if (c == '[') inBrackets = true;
-                else if (c == ']') inBrackets = false;
-
-                if (c == ',' && !inBrackets) {
-                    if (!current.empty()) {
-                        // Trim
-                        current.erase(0, current.find_first_not_of(" \t"));
-                        current.erase(current.find_last_not_of(" \t") + 1);
-                        operands.push_back(current);
-                        current.clear();
+            for (char c : operandLine) {
+                if (c == '[') {
+                    bracketDepth++;
+                    currentOp += c;
+                }
+                else if (c == ']') {
+                    bracketDepth--;
+                    currentOp += c;
+                }
+                else if (c == ',' && bracketDepth == 0) {
+                    // Trim and add operand
+                    currentOp.erase(0, currentOp.find_first_not_of(" \t"));
+                    currentOp.erase(currentOp.find_last_not_of(" \t") + 1);
+                    if (!currentOp.empty()) {
+                        operands.push_back(currentOp);
                     }
+                    currentOp.clear();
                 }
-                else {
-                    current += c;
+                else if (c != ' ' && c != '\t' || bracketDepth > 0 || !currentOp.empty()) {
+                    currentOp += c;
                 }
             }
 
-            if (!current.empty()) {
-                current.erase(0, current.find_first_not_of(" \t"));
-                current.erase(current.find_last_not_of(" \t") + 1);
-                operands.push_back(current);
+            // Add last operand
+            currentOp.erase(0, currentOp.find_first_not_of(" \t"));
+            currentOp.erase(currentOp.find_last_not_of(" \t") + 1);
+            if (!currentOp.empty()) {
+                operands.push_back(currentOp);
             }
         }
 
-        // Handle different instructions
-        if (mnemonic == "push") {
-            return HandlePush(assembler, operands);
-        }
-        else if (mnemonic == "pop") {
-            return HandlePop(assembler, operands);
-        }
-        else if (mnemonic == "mov") {
-            return HandleMov(assembler, operands);
-        }
-        else if (mnemonic == "movss") {
-            return HandleMovss(assembler, operands);
-        }
-        else if (mnemonic == "lea") {
-            return HandleLea(assembler, operands);
-        }
-        else if (mnemonic == "add") {
-            return HandleAdd(assembler, operands);
-        }
-        else if (mnemonic == "sub") {
-            return HandleSub(assembler, operands);
-        }
-        else if (mnemonic == "test") {
-            return HandleTest(assembler, operands);
-        }
-        else if (mnemonic == "cmp") {
-            return HandleCmp(assembler, operands);
-        }
-        else if (mnemonic == "jmp") {
-            return HandleJmp(assembler, operands, labelMap);
-        }
-        else if (mnemonic == "call") {
-            return HandleCall(assembler, operands, labelMap);
-        }
-        else if (mnemonic == "je" || mnemonic == "jz") {
-            return HandleJcc(assembler, x86::kCondE, operands, labelMap);
-        }
-        else if (mnemonic == "jne" || mnemonic == "jnz") {
-            return HandleJcc(assembler, x86::kCondNE, operands, labelMap);
-        }
-        else if (mnemonic == "jg") {
-            return HandleJcc(assembler, x86::kCondG, operands, labelMap);
-        }
-        else if (mnemonic == "jge") {
-            return HandleJcc(assembler, x86::kCondGE, operands, labelMap);
-        }
-        else if (mnemonic == "jl") {
-            return HandleJcc(assembler, x86::kCondL, operands, labelMap);
-        }
-        else if (mnemonic == "jle") {
-            return HandleJcc(assembler, x86::kCondLE, operands, labelMap);
-        }
-        else if (mnemonic == "ja") {
-            return HandleJcc(assembler, x86::kCondA, operands, labelMap);
-        }
-        else if (mnemonic == "jae") {
-            return HandleJcc(assembler, x86::kCondAE, operands, labelMap);
-        }
-        else if (mnemonic == "jb") {
-            return HandleJcc(assembler, x86::kCondB, operands, labelMap);
-        }
-        else if (mnemonic == "jbe") {
-            return HandleJcc(assembler, x86::kCondBE, operands, labelMap);
-        }
-        else if (mnemonic == "nop") {
-            assembler.nop();
-            return true;
-        }
-        else if (mnemonic == "ret") {
-            assembler.ret();
-            return true;
-        }
+        try {
+            // Handle data directives
+            if (mnemonic == "db" || mnemonic == "dw" || mnemonic == "dd" || mnemonic == "dq") {
+                return HandleDataDirective(ctx, mnemonic, operands);
+            }
 
-        return false;
-    }
+            // Handle special instructions
+            if (HandleSpecialInstruction(ctx, mnemonic, operands)) {
+                return true;
+            }
 
-    // Parse register
-    x86::Gp AssemblyEngine::ParseRegister(const std::string& str) {
-        using namespace asmjit::x86;
+            // MOV instruction
+            if (mnemonic == "mov") {
+                if (operands.size() != 2) return false;
 
-        // 64-bit registers
-        if (str == "rax") return rax;
-        if (str == "rbx") return rbx;
-        if (str == "rcx") return rcx;
-        if (str == "rdx") return rdx;
-        if (str == "rsi") return rsi;
-        if (str == "rdi") return rdi;
-        if (str == "rbp") return rbp;
-        if (str == "rsp") return rsp;
-        if (str == "r8") return r8;
-        if (str == "r9") return r9;
-        if (str == "r10") return r10;
-        if (str == "r11") return r11;
-        if (str == "r12") return r12;
-        if (str == "r13") return r13;
-        if (str == "r14") return r14;
-        if (str == "r15") return r15;
+                if (operands[0][0] == '[') {
+                    // Memory destination
+                    Mem mem = ParseMemoryOperand(ctx, operands[0]);
 
-        // 32-bit registers
-        if (str == "eax") return eax;
-        if (str == "ebx") return ebx;
-        if (str == "ecx") return ecx;
-        if (str == "edx") return edx;
-        if (str == "esi") return esi;
-        if (str == "edi") return edi;
-        if (str == "ebp") return ebp;
-        if (str == "esp") return esp;
-
-        // 16-bit registers
-        if (str == "ax") return ax;
-        if (str == "bx") return bx;
-        if (str == "cx") return cx;
-        if (str == "dx") return dx;
-
-        // 8-bit registers
-        if (str == "al") return al;
-        if (str == "bl") return bl;
-        if (str == "cl") return cl;
-        if (str == "dl") return dl;
-
-        return x86::Gp(); // Invalid
-    }
-
-    // Parse XMM register
-    x86::Xmm AssemblyEngine::ParseXmmRegister(const std::string& str) {
-        using namespace asmjit::x86;
-
-        if (str == "xmm0") return xmm0;
-        if (str == "xmm1") return xmm1;
-        if (str == "xmm2") return xmm2;
-        if (str == "xmm3") return xmm3;
-        if (str == "xmm4") return xmm4;
-        if (str == "xmm5") return xmm5;
-        if (str == "xmm6") return xmm6;
-        if (str == "xmm7") return xmm7;
-
-        return x86::Xmm(); // Invalid
-    }
-
-    // Parse memory operand
-    x86::Mem AssemblyEngine::ParseMemory(const std::string& str) {
-        // Remove brackets
-        std::string expr = str.substr(1, str.length() - 2);
-
-        x86::Gp base;
-        x86::Gp index;
-        uint32_t scale = 1;
-        int32_t disp = 0;
-        bool hasBase = false;
-        bool hasIndex = false;
-
-        // Simple parser for [base+index*scale+disp] format
-        std::regex memRegex(R"(([a-zA-Z0-9]+)?(?:\s*\+\s*([a-zA-Z0-9]+)(?:\s*\*\s*(\d+))?)?(?:\s*([+-])\s*0x([0-9A-Fa-f]+))?(?:\s*([+-])\s*(\d+))?)");
-        std::smatch match;
-
-        // For simple absolute addresses like [0x12345678]
-        if (expr.find_first_of("+-*") == std::string::npos && !ParseRegister(expr).isValid()) {
-            // Pure address
-            uint64_t addr = ParseImmediate(expr);
-            return x86::ptr(addr);
-        }
-
-        // Parse complex expressions
-        std::string token;
-        bool expectOp = false;
-        char lastOp = '+';
-
-        for (size_t i = 0; i < expr.length(); i++) {
-            char c = expr[i];
-
-            if (c == ' ' || c == '\t') continue;
-
-            if (c == '+' || c == '-' || c == '*') {
-                if (!token.empty()) {
-                    // Process token
-                    if (ParseRegister(token).isValid()) {
-                        if (!hasBase) {
-                            base = ParseRegister(token);
-                            hasBase = true;
-                        }
-                        else {
-                            index = ParseRegister(token);
-                            hasIndex = true;
-                        }
+                    if (ParseGpRegister(operands[1]).isValid()) {
+                        ctx.assembler.mov(mem, ParseGpRegister(operands[1]));
+                    }
+                    else if (ParseXmmRegister(operands[1]).isValid()) {
+                        // Can't directly mov xmm to memory, use movd/movq
+                        Xmm xmm = ParseXmmRegister(operands[1]);
+                        ctx.assembler.movd(mem, xmm);
                     }
                     else {
-                        // It's a displacement
-                        int32_t val = ParseImmediate(token);
-                        if (lastOp == '-') val = -val;
-                        disp += val;
+                        // Immediate to memory
+                        Imm imm = ResolveImmediate(ctx, operands[1]);
+                        ctx.assembler.mov(mem, imm);
                     }
-                    token.clear();
                 }
-                lastOp = c;
-                expectOp = false;
-            }
-            else {
-                token += c;
-            }
-        }
+                else if (ParseGpRegister(operands[0]).isValid()) {
+                    // Register destination
+                    Gp reg1 = ParseGpRegister(operands[0]);
 
-        // Process last token
-        if (!token.empty()) {
-            if (ParseRegister(token).isValid()) {
-                if (!hasBase) {
-                    base = ParseRegister(token);
-                    hasBase = true;
+                    if (operands[1][0] == '[') {
+                        // mov reg, [mem]
+                        Mem mem = ParseMemoryOperand(ctx, operands[1]);
+                        ctx.assembler.mov(reg1, mem);
+                    }
+                    else if (ParseGpRegister(operands[1]).isValid()) {
+                        // mov reg, reg
+                        ctx.assembler.mov(reg1, ParseGpRegister(operands[1]));
+                    }
+                    else {
+                        // mov reg, imm
+                        Imm imm = ResolveImmediate(ctx, operands[1]);
+                        ctx.assembler.mov(reg1, imm);
+                    }
+                }
+                else if (ParseXmmRegister(operands[0]).isValid()) {
+                    // XMM register destination
+                    Xmm xmm1 = ParseXmmRegister(operands[0]);
+
+                    if (operands[1][0] == '[') {
+                        ctx.assembler.movd(xmm1, ParseMemoryOperand(ctx, operands[1]));
+                    }
+                    else if (ParseXmmRegister(operands[1]).isValid()) {
+                        ctx.assembler.movaps(xmm1, ParseXmmRegister(operands[1]));
+                    }
                 }
                 else {
-                    index = ParseRegister(token);
-                    hasIndex = true;
+                    return false;
+                }
+                return true;
+            }
+
+            // MOVSS instruction
+            else if (mnemonic == "movss") {
+                if (operands.size() != 2) return false;
+
+                if (ParseXmmRegister(operands[0]).isValid()) {
+                    Xmm xmm = ParseXmmRegister(operands[0]);
+
+                    if (operands[1][0] == '[') {
+                        ctx.assembler.movss(xmm, ParseMemoryOperand(ctx, operands[1]));
+                    }
+                    else if (ParseXmmRegister(operands[1]).isValid()) {
+                        ctx.assembler.movss(xmm, ParseXmmRegister(operands[1]));
+                    }
+                }
+                else if (operands[0][0] == '[' && ParseXmmRegister(operands[1]).isValid()) {
+                    ctx.assembler.movss(ParseMemoryOperand(ctx, operands[0]), ParseXmmRegister(operands[1]));
+                }
+                return true;
+            }
+
+            // JMP instruction
+            else if (mnemonic == "jmp") {
+                if (operands.empty()) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    // jmp reg
+                    ctx.assembler.jmp(ParseGpRegister(operands[0]));
+                }
+                else if (operands[0][0] == '[') {
+                    // jmp [mem]
+                    ctx.assembler.jmp(ParseMemoryOperand(ctx, operands[0]));
+                }
+                else {
+                    // jmp label/address
+                    // First try as immediate address
+                    if (operands[0].find("0x") == 0 || std::all_of(operands[0].begin(), operands[0].end(), ::isxdigit)) {
+                        uint64_t addr = std::stoull(operands[0], nullptr, 16);
+                        ctx.assembler.jmp(imm(addr));
+                    }
+                    else {
+                        // It's a label
+                        Label label = ctx.GetOrCreateLabel(operands[0]);
+                        ctx.assembler.jmp(label);
+                    }
+                }
+                return true;
+            }
+
+            // CALL instruction
+            else if (mnemonic == "call") {
+                if (operands.empty()) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    ctx.assembler.call(ParseGpRegister(operands[0]));
+                }
+                else if (operands[0][0] == '[') {
+                    ctx.assembler.call(ParseMemoryOperand(ctx, operands[0]));
+                }
+                else {
+                    // Try as immediate address first
+                    if (operands[0].find("0x") == 0 || std::all_of(operands[0].begin(), operands[0].end(), ::isxdigit)) {
+                        uint64_t addr = std::stoull(operands[0], nullptr, 16);
+                        ctx.assembler.call(imm(addr));
+                    }
+                    else {
+                        Label label = ctx.GetOrCreateLabel(operands[0]);
+                        ctx.assembler.call(label);
+                    }
+                }
+                return true;
+            }
+
+            // PUSH/POP
+            else if (mnemonic == "push") {
+                if (operands.empty()) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    ctx.assembler.push(ParseGpRegister(operands[0]));
+                }
+                else if (operands[0][0] == '[') {
+                    ctx.assembler.push(ParseMemoryOperand(ctx, operands[0]));
+                }
+                else {
+                    ctx.assembler.push(ResolveImmediate(ctx, operands[0]));
+                }
+                return true;
+            }
+            else if (mnemonic == "pop") {
+                if (operands.empty()) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    ctx.assembler.pop(ParseGpRegister(operands[0]));
+                }
+                else if (operands[0][0] == '[') {
+                    ctx.assembler.pop(ParseMemoryOperand(ctx, operands[0]));
+                }
+                return true;
+            }
+
+            // ADD/SUB
+            else if (mnemonic == "add" || mnemonic == "sub") {
+                if (operands.size() != 2) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    Gp reg = ParseGpRegister(operands[0]);
+
+                    if (ParseGpRegister(operands[1]).isValid()) {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(reg, ParseGpRegister(operands[1]));
+                        else
+                            ctx.assembler.sub(reg, ParseGpRegister(operands[1]));
+                    }
+                    else if (operands[1][0] == '[') {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(reg, ParseMemoryOperand(ctx, operands[1]));
+                        else
+                            ctx.assembler.sub(reg, ParseMemoryOperand(ctx, operands[1]));
+                    }
+                    else {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(reg, ResolveImmediate(ctx, operands[1]));
+                        else
+                            ctx.assembler.sub(reg, ResolveImmediate(ctx, operands[1]));
+                    }
+                }
+                else if (operands[0][0] == '[') {
+                    Mem mem = ParseMemoryOperand(ctx, operands[0]);
+
+                    if (ParseGpRegister(operands[1]).isValid()) {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(mem, ParseGpRegister(operands[1]));
+                        else
+                            ctx.assembler.sub(mem, ParseGpRegister(operands[1]));
+                    }
+                    else {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(mem, ResolveImmediate(ctx, operands[1]));
+                        else
+                            ctx.assembler.sub(mem, ResolveImmediate(ctx, operands[1]));
+                    }
+                }
+                return true;
+            }
+
+            // LEA
+            else if (mnemonic == "lea") {
+                if (operands.size() != 2) return false;
+
+                if (ParseGpRegister(operands[0]).isValid() && operands[1][0] == '[') {
+                    ctx.assembler.lea(ParseGpRegister(operands[0]), ParseMemoryOperand(ctx, operands[1]));
+                    return true;
+                }
+            }
+
+            // TEST/CMP
+            else if (mnemonic == "test" || mnemonic == "cmp") {
+                if (operands.size() != 2) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    Gp reg = ParseGpRegister(operands[0]);
+
+                    if (ParseGpRegister(operands[1]).isValid()) {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(reg, ParseGpRegister(operands[1]));
+                        else
+                            ctx.assembler.cmp(reg, ParseGpRegister(operands[1]));
+                    }
+                    else if (operands[1][0] == '[') {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(reg, ParseMemoryOperand(ctx, operands[1]));
+                        else
+                            ctx.assembler.cmp(reg, ParseMemoryOperand(ctx, operands[1]));
+                    }
+                    else {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(reg, ResolveImmediate(ctx, operands[1]));
+                        else
+                            ctx.assembler.cmp(reg, ResolveImmediate(ctx, operands[1]));
+                    }
+                }
+                else if (operands[0][0] == '[') {
+                    Mem mem = ParseMemoryOperand(ctx, operands[0]);
+
+                    if (ParseGpRegister(operands[1]).isValid()) {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(mem, ParseGpRegister(operands[1]));
+                        else
+                            ctx.assembler.cmp(mem, ParseGpRegister(operands[1]));
+                    }
+                    else {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(mem, ResolveImmediate(ctx, operands[1]));
+                        else
+                            ctx.assembler.cmp(mem, ResolveImmediate(ctx, operands[1]));
+                    }
+                }
+                return true;
+            }
+
+            // XOR
+            else if (mnemonic == "xor") {
+                if (operands.size() != 2) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    Gp reg1 = ParseGpRegister(operands[0]);
+
+                    if (ParseGpRegister(operands[1]).isValid()) {
+                        ctx.assembler.xor_(reg1, ParseGpRegister(operands[1]));
+                    }
+                    else if (operands[1][0] == '[') {
+                        ctx.assembler.xor_(reg1, ParseMemoryOperand(ctx, operands[1]));
+                    }
+                    else {
+                        ctx.assembler.xor_(reg1, ResolveImmediate(ctx, operands[1]));
+                    }
+                }
+                return true;
+            }
+
+            // INC/DEC
+            else if (mnemonic == "inc" || mnemonic == "dec") {
+                if (operands.empty()) return false;
+
+                if (ParseGpRegister(operands[0]).isValid()) {
+                    if (mnemonic == "inc")
+                        ctx.assembler.inc(ParseGpRegister(operands[0]));
+                    else
+                        ctx.assembler.dec(ParseGpRegister(operands[0]));
+                }
+                else if (operands[0][0] == '[') {
+                    if (mnemonic == "inc")
+                        ctx.assembler.inc(ParseMemoryOperand(ctx, operands[0]));
+                    else
+                        ctx.assembler.dec(ParseMemoryOperand(ctx, operands[0]));
+                }
+                return true;
+            }
+
+            // Conditional jumps
+            else if (mnemonic == "je" || mnemonic == "jz") {
+                if (operands.empty()) return false;
+                ctx.assembler.je(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jne" || mnemonic == "jnz") {
+                if (operands.empty()) return false;
+                ctx.assembler.jne(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jg") {
+                if (operands.empty()) return false;
+                ctx.assembler.jg(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "ja") {
+                if (operands.empty()) return false;
+                ctx.assembler.ja(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jae") {
+                if (operands.empty()) return false;
+                ctx.assembler.jae(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jb") {
+                if (operands.empty()) return false;
+                ctx.assembler.jb(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jbe") {
+                if (operands.empty()) return false;
+                ctx.assembler.jbe(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jl") {
+                if (operands.empty()) return false;
+                ctx.assembler.jl(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jle") {
+                if (operands.empty()) return false;
+                ctx.assembler.jle(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+            else if (mnemonic == "jge") {
+                if (operands.empty()) return false;
+                ctx.assembler.jge(ctx.GetOrCreateLabel(operands[0]));
+                return true;
+            }
+
+            // COMISS/UCOMISS
+            else if (mnemonic == "comiss" || mnemonic == "ucomiss") {
+                if (operands.size() != 2) return false;
+
+                if (ParseXmmRegister(operands[0]).isValid()) {
+                    Xmm xmm = ParseXmmRegister(operands[0]);
+
+                    if (operands[1][0] == '[') {
+                        if (mnemonic == "comiss")
+                            ctx.assembler.comiss(xmm, ParseMemoryOperand(ctx, operands[1]));
+                        else
+                            ctx.assembler.ucomiss(xmm, ParseMemoryOperand(ctx, operands[1]));
+                    }
+                    else if (ParseXmmRegister(operands[1]).isValid()) {
+                        if (mnemonic == "comiss")
+                            ctx.assembler.comiss(xmm, ParseXmmRegister(operands[1]));
+                        else
+                            ctx.assembler.ucomiss(xmm, ParseXmmRegister(operands[1]));
+                    }
+                }
+                return true;
+            }
+
+            // RET
+            else if (mnemonic == "ret") {
+                if (operands.empty()) {
+                    ctx.assembler.ret();
+                }
+                else {
+                    // ret with immediate (stack cleanup)
+                    ctx.assembler.ret(ResolveImmediate(ctx, operands[0]));
+                }
+                return true;
+            }
+
+            // NOP
+            else if (mnemonic == "nop") {
+                if (operands.empty()) {
+                    ctx.assembler.nop();
+                }
+                else {
+                    // Multiple NOPs
+                    int count = std::stoi(operands[0]);
+                    for (int i = 0; i < count; ++i) {
+                        ctx.assembler.nop();
+                    }
+                }
+                return true;
+            }
+
+            // INT3
+            else if (mnemonic == "int3") {
+                ctx.assembler.int3();
+                return true;
+            }
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[ERROR] Assembly exception: " << e.what() << std::endl;
+            return false;
+        }
+
+        std::cerr << "[WARNING] Unhandled mnemonic: " << mnemonic << std::endl;
+        return false;
+    }
+
+    Mem AssemblyEngine::ParseMemoryOperand(AssemblyContext& ctx, const std::string& memExpr) {
+        // Remove brackets
+        std::string expr = memExpr;
+        if (expr.front() == '[') expr = expr.substr(1);
+        if (expr.back() == ']') expr.pop_back();
+
+        // Trim whitespace
+        expr.erase(0, expr.find_first_not_of(" \t"));
+        expr.erase(expr.find_last_not_of(" \t") + 1);
+
+        std::cout << "[DEBUG] Parsing memory operand: " << expr << std::endl;
+
+        // Parse components: base + index*scale + displacement
+        Gp base;
+        Gp index;
+        uint32_t scale = 0;
+        int64_t displacement = 0;
+
+        // Tokenize the expression
+        std::vector<std::string> tokens;
+        std::string currentToken;
+        bool lastWasOperator = true;
+
+        for (size_t i = 0; i < expr.length(); ++i) {
+            char c = expr[i];
+
+            if (c == '+' || c == '-' || c == '*') {
+                if (!currentToken.empty()) {
+                    tokens.push_back(currentToken);
+                    currentToken.clear();
+                }
+                tokens.push_back(std::string(1, c));
+                lastWasOperator = true;
+            }
+            else if (c == ' ' || c == '\t') {
+                if (!currentToken.empty() && !lastWasOperator) {
+                    tokens.push_back(currentToken);
+                    currentToken.clear();
                 }
             }
             else {
-                int32_t val = ParseImmediate(token);
-                if (lastOp == '-') val = -val;
-                disp += val;
+                currentToken += c;
+                lastWasOperator = false;
             }
         }
 
-        // Create memory operand
-        if (hasBase && hasIndex) {
-            return x86::ptr(base, index, scale, disp);
+        if (!currentToken.empty()) {
+            tokens.push_back(currentToken);
         }
-        else if (hasBase) {
-            return x86::ptr(base, disp);
+
+        // Process tokens
+        bool expectingScale = false;
+        bool negativeNext = false;
+
+        for (size_t i = 0; i < tokens.size(); ++i) {
+            const std::string& token = tokens[i];
+
+            if (token == "+") {
+                negativeNext = false;
+            }
+            else if (token == "-") {
+                negativeNext = true;
+            }
+            else if (token == "*") {
+                expectingScale = true;
+            }
+            else if (expectingScale) {
+                scale = std::stoul(token);
+                expectingScale = false;
+            }
+            else if (ParseGpRegister(token).isValid()) {
+                Gp reg = ParseGpRegister(token);
+
+                // Check if next token is * for scale
+                if (i + 2 < tokens.size() && tokens[i + 1] == "*") {
+                    index = reg;
+                    i++; // Skip *
+                    scale = std::stoul(tokens[i + 1]);
+                    i++; // Skip scale
+                }
+                else if (!base.isValid()) {
+                    base = reg;
+                }
+                else if (!index.isValid()) {
+                    index = reg;
+                    scale = 1; // Default scale
+                }
+            }
+            else {
+                // Must be a displacement or symbol
+                int64_t value = 0;
+
+                // First try to resolve as symbol
+                bool resolved = false;
+                if (symbolManager_) {
+                    auto addr = symbolManager_->ResolveAddress(token);
+                    if (addr) {
+                        value = static_cast<int64_t>(*addr);
+                        resolved = true;
+                        std::cout << "[DEBUG]   Resolved symbol '" << token << "' to 0x"
+                            << std::hex << *addr << std::dec << std::endl;
+                    }
+                }
+
+                // If not a symbol, parse as number
+                if (!resolved) {
+                    try {
+                        if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) {
+                            value = std::stoll(token, nullptr, 16);
+                        }
+                        else {
+                            // Check if all hex digits (no 0x prefix)
+                            bool isHex = std::all_of(token.begin(), token.end(),
+                                [](char c) { return std::isxdigit(c); });
+
+                            if (isHex && token.find_first_of("abcdefABCDEF") != std::string::npos) {
+                                value = std::stoll(token, nullptr, 16);
+                            }
+                            else {
+                                value = std::stoll(token);
+                            }
+                        }
+                    }
+                    catch (...) {
+                        std::cerr << "[WARNING] Failed to parse displacement: " << token << std::endl;
+                        value = 0;
+                    }
+                }
+
+                displacement += (negativeNext ? -value : value);
+                negativeNext = false;
+            }
+        }
+
+        // Build memory operand
+        if (base.isValid() && index.isValid() && scale > 0) {
+            std::cout << "[DEBUG]   Memory: base=" << base.name() << " index=" << index.name()
+                << " scale=" << scale << " disp=" << displacement << std::endl;
+            return ptr(base, index, scale, static_cast<int32_t>(displacement));
+        }
+        else if (base.isValid() && index.isValid()) {
+            std::cout << "[DEBUG]   Memory: base=" << base.name() << " index=" << index.name()
+                << " disp=" << displacement << std::endl;
+            return ptr(base, index, 0, static_cast<int32_t>(displacement));
+        }
+        else if (base.isValid()) {
+            std::cout << "[DEBUG]   Memory: base=" << base.name() << " disp=" << displacement << std::endl;
+            return ptr(base, static_cast<int32_t>(displacement));
         }
         else {
-            return x86::ptr(disp);
+            // Absolute address
+            std::cout << "[DEBUG]   Memory: absolute addr=0x" << std::hex << displacement << std::dec << std::endl;
+            return ptr(static_cast<uint64_t>(displacement));
         }
     }
 
-    // Parse immediate value
-    uint64_t AssemblyEngine::ParseImmediate(const std::string& str) {
-        if (str.empty()) return 0;
+    Gp AssemblyEngine::ParseGpRegister(const std::string& regName) {
+        std::string lower = regName;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-        // Handle hex
-        if (str.size() > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
-            return std::stoull(str, nullptr, 16);
-        }
+        // 64-bit registers
+        if (lower == "rax") return rax;
+        if (lower == "rbx") return rbx;
+        if (lower == "rcx") return rcx;
+        if (lower == "rdx") return rdx;
+        if (lower == "rsi") return rsi;
+        if (lower == "rdi") return rdi;
+        if (lower == "rbp") return rbp;
+        if (lower == "rsp") return rsp;
+        if (lower == "r8")  return r8;
+        if (lower == "r9")  return r9;
+        if (lower == "r10") return r10;
+        if (lower == "r11") return r11;
+        if (lower == "r12") return r12;
+        if (lower == "r13") return r13;
+        if (lower == "r14") return r14;
+        if (lower == "r15") return r15;
 
-        // Default to decimal
-        return std::stoull(str, nullptr, 10);
+        // 32-bit registers
+        if (lower == "eax") return eax;
+        if (lower == "ebx") return ebx;
+        if (lower == "ecx") return ecx;
+        if (lower == "edx") return edx;
+        if (lower == "esi") return esi;
+        if (lower == "edi") return edi;
+        if (lower == "ebp") return ebp;
+        if (lower == "esp") return esp;
+        if (lower == "r8d")  return r8d;
+        if (lower == "r9d")  return r9d;
+        if (lower == "r10d") return r10d;
+        if (lower == "r11d") return r11d;
+        if (lower == "r12d") return r12d;
+        if (lower == "r13d") return r13d;
+        if (lower == "r14d") return r14d;
+        if (lower == "r15d") return r15d;
+
+        // 16-bit registers
+        if (lower == "ax")  return ax;
+        if (lower == "bx")  return bx;
+        if (lower == "cx")  return cx;
+        if (lower == "dx")  return dx;
+        if (lower == "si")  return si;
+        if (lower == "di")  return di;
+        if (lower == "bp")  return bp;
+        if (lower == "sp")  return sp;
+        if (lower == "r8w")  return r8w;
+        if (lower == "r9w")  return r9w;
+        if (lower == "r10w") return r10w;
+        if (lower == "r11w") return r11w;
+        if (lower == "r12w") return r12w;
+        if (lower == "r13w") return r13w;
+        if (lower == "r14w") return r14w;
+        if (lower == "r15w") return r15w;
+
+        // 8-bit registers
+        if (lower == "al")  return al;
+        if (lower == "bl")  return bl;
+        if (lower == "cl")  return cl;
+        if (lower == "dl")  return dl;
+        if (lower == "sil") return sil;
+        if (lower == "dil") return dil;
+        if (lower == "bpl") return bpl;
+        if (lower == "spl") return spl;
+        if (lower == "ah")  return ah;
+        if (lower == "bh")  return bh;
+        if (lower == "ch")  return ch;
+        if (lower == "dh")  return dh;
+        if (lower == "r8b")  return r8b;
+        if (lower == "r9b")  return r9b;
+        if (lower == "r10b") return r10b;
+        if (lower == "r11b") return r11b;
+        if (lower == "r12b") return r12b;
+        if (lower == "r13b") return r13b;
+        if (lower == "r14b") return r14b;
+        if (lower == "r15b") return r15b;
+
+        // Return invalid register
+        return Gp();
     }
 
-    // Instruction handlers
-    bool AssemblyEngine::HandleMov(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    Xmm AssemblyEngine::ParseXmmRegister(const std::string& regName) {
+        std::string lower = regName;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
+        if (lower == "xmm0")  return xmm0;
+        if (lower == "xmm1")  return xmm1;
+        if (lower == "xmm2")  return xmm2;
+        if (lower == "xmm3")  return xmm3;
+        if (lower == "xmm4")  return xmm4;
+        if (lower == "xmm5")  return xmm5;
+        if (lower == "xmm6")  return xmm6;
+        if (lower == "xmm7")  return xmm7;
+        if (lower == "xmm8")  return xmm8;
+        if (lower == "xmm9")  return xmm9;
+        if (lower == "xmm10") return xmm10;
+        if (lower == "xmm11") return xmm11;
+        if (lower == "xmm12") return xmm12;
+        if (lower == "xmm13") return xmm13;
+        if (lower == "xmm14") return xmm14;
+        if (lower == "xmm15") return xmm15;
 
-        // reg, reg
-        x86::Gp dstReg = ParseRegister(dst);
-        x86::Gp srcReg = ParseRegister(src);
+        return Xmm();
+    }
 
-        if (dstReg.isValid() && srcReg.isValid()) {
-            assembler.mov(dstReg, srcReg);
-            return true;
+    Mm AssemblyEngine::ParseMmRegister(const std::string& regName) {
+        std::string lower = regName;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        if (lower == "mm0") return mm0;
+        if (lower == "mm1") return mm1;
+        if (lower == "mm2") return mm2;
+        if (lower == "mm3") return mm3;
+        if (lower == "mm4") return mm4;
+        if (lower == "mm5") return mm5;
+        if (lower == "mm6") return mm6;
+        if (lower == "mm7") return mm7;
+
+        return Mm();
+    }
+
+    Imm AssemblyEngine::ResolveImmediate(AssemblyContext& ctx, const std::string& value) {
+        std::cout << "[DEBUG] Resolving immediate: " << value << std::endl;
+
+        // First try to resolve from captures
+        if (captureStorage_ && captureStorage_->Exists(value)) {
+            auto capture = captureStorage_->Get(value);
+            if (capture) {
+                uint64_t val = 0;
+                switch (capture->size) {
+                case 1: val = capture->AsUInt8(); break;
+                case 2: val = capture->AsUInt16(); break;
+                case 4: val = capture->AsUInt32(); break;
+                case 8: val = capture->AsUInt64(); break;
+                }
+                std::cout << "[DEBUG]   Resolved capture '" << value << "' to 0x"
+                    << std::hex << val << std::dec << std::endl;
+                return imm(val);
+            }
         }
 
-        // reg, imm
-        if (dstReg.isValid() && !srcReg.isValid() && src[0] != '[') {
-            uint64_t imm = ParseImmediate(src);
-            assembler.mov(dstReg, imm);
-            return true;
+        // Then try symbols
+        if (symbolManager_) {
+            auto addr = symbolManager_->ResolveAddress(value);
+            if (addr) {
+                std::cout << "[DEBUG]   Resolved symbol '" << value << "' to 0x"
+                    << std::hex << *addr << std::dec << std::endl;
+                return imm(*addr);
+            }
         }
 
-        // reg, mem
-        if (dstReg.isValid() && src[0] == '[') {
-            assembler.mov(dstReg, ParseMemory(src));
-            return true;
+        // Check if it's a float cast
+        if (value.find("(float)") == 0) {
+            std::string floatStr = value.substr(7);
+            float f = std::stof(floatStr);
+            uint32_t bits = *reinterpret_cast<uint32_t*>(&f);
+            std::cout << "[DEBUG]   Resolved float " << f << " to 0x"
+                << std::hex << bits << std::dec << std::endl;
+            return imm(bits);
         }
 
-        // mem, reg
-        if (dst[0] == '[' && srcReg.isValid()) {
-            assembler.mov(ParseMemory(dst), srcReg);
-            return true;
-        }
-
-        // mem, imm - special handling
-        if (dst[0] == '[' && !srcReg.isValid() && src[0] != '[') {
-            x86::Mem mem = ParseMemory(dst);
-            uint64_t imm = ParseImmediate(src);
-
-            // Determine size based on immediate value
-            if (imm <= 0xFFFFFFFF) {
-                mem.setSize(4); // dword
-                assembler.mov(mem, static_cast<uint32_t>(imm));
+        // Parse as number
+        uint64_t result = 0;
+        try {
+            if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+                result = std::stoull(value, nullptr, 16);
+            }
+            else if (value[0] == '$') {
+                // CE style hex
+                result = std::stoull(value.substr(1), nullptr, 16);
+            }
+            else if (std::all_of(value.begin(), value.end(), ::isxdigit)) {
+                // Pure hex without prefix
+                result = std::stoull(value, nullptr, 16);
             }
             else {
-                // For 64-bit immediates, we need to use a temporary register
-                assembler.push(x86::rax);
-                assembler.mov(x86::rax, imm);
-                assembler.mov(mem, x86::rax);
-                assembler.pop(x86::rax);
+                // Decimal
+                result = std::stoull(value);
             }
-            return true;
+        }
+        catch (...) {
+            std::cerr << "[WARNING] Failed to parse immediate: " << value << std::endl;
+            result = 0;
         }
 
-        return false;
+        std::cout << "[DEBUG]   Parsed immediate as 0x" << std::hex << result << std::dec << std::endl;
+        return imm(result);
     }
 
-    bool AssemblyEngine::HandleMovss(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    std::string AssemblyEngine::PreprocessLine(const std::string& line, AssemblyContext& ctx) const {
+        std::string result = line;
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
+        // Replace capture references
+        result = ReplaceCaptureReferences(result);
 
-        x86::Xmm dstXmm = ParseXmmRegister(dst);
-        x86::Xmm srcXmm = ParseXmmRegister(src);
+        // Replace symbol references
+        result = ReplaceSymbolReferences(result, ctx);
 
-        // xmm, xmm
-        if (dstXmm.isValid() && srcXmm.isValid()) {
-            assembler.movss(dstXmm, srcXmm);
-            return true;
-        }
-
-        // xmm, mem
-        if (dstXmm.isValid() && src[0] == '[') {
-            assembler.movss(dstXmm, ParseMemory(src));
-            return true;
-        }
-
-        // mem, xmm
-        if (dst[0] == '[' && srcXmm.isValid()) {
-            assembler.movss(ParseMemory(dst), srcXmm);
-            return true;
-        }
-
-        return false;
+        return result;
     }
 
-    bool AssemblyEngine::HandleCmp(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
-
-        const std::string& op1 = operands[0];
-        const std::string& op2 = operands[1];
-
-        x86::Gp reg1 = ParseRegister(op1);
-        x86::Gp reg2 = ParseRegister(op2);
-
-        // reg, reg
-        if (reg1.isValid() && reg2.isValid()) {
-            assembler.cmp(reg1, reg2);
-            return true;
+    std::string AssemblyEngine::ReplaceCaptureReferences(const std::string& line) const {
+        if (!captureStorage_) {
+            return line;
         }
 
-        // reg, imm
-        if (reg1.isValid() && !reg2.isValid() && op2[0] != '[') {
-            uint64_t imm = ParseImmediate(op2);
-            assembler.cmp(reg1, imm);
-            return true;
-        }
+        std::string result = line;
+        auto captureNames = captureStorage_->GetAllNames();
 
-        // reg, mem
-        if (reg1.isValid() && op2[0] == '[') {
-            assembler.cmp(reg1, ParseMemory(op2));
-            return true;
-        }
+        std::cout << "[DEBUG] Replacing captures in: " << line << std::endl;
 
-        // mem, reg
-        if (op1[0] == '[' && reg2.isValid()) {
-            assembler.cmp(ParseMemory(op1), reg2);
-            return true;
-        }
+        // Sort by length descending to replace longer names first
+        std::sort(captureNames.begin(), captureNames.end(),
+            [](const std::string& a, const std::string& b) {
+                return a.length() > b.length();
+            });
 
-        // mem, imm
-        if (op1[0] == '[' && !reg2.isValid() && op2[0] != '[') {
-            x86::Mem mem = ParseMemory(op1);
-            uint64_t imm = ParseImmediate(op2);
+        for (const auto& captureName : captureNames) {
+            std::regex captureRegex(R"(\b)" + captureName + R"(\b)");
 
-            // Set appropriate size
-            if (imm <= 0xFF) {
-                mem.setSize(1);
-                assembler.cmp(mem, static_cast<uint8_t>(imm));
+            auto capture = captureStorage_->Get(captureName);
+            if (!capture) continue;
+
+            std::string replacement;
+            switch (capture->size) {
+            case 1:
+                replacement = "0x" + std::to_string(capture->AsUInt8());
+                break;
+            case 2:
+                replacement = "0x" + std::to_string(capture->AsUInt16());
+                break;
+            case 4:
+                replacement = "0x" + std::to_string(capture->AsUInt32());
+                break;
+            case 8:
+                replacement = "0x" + std::to_string(capture->AsUInt64());
+                break;
             }
-            else if (imm <= 0xFFFF) {
-                mem.setSize(2);
-                assembler.cmp(mem, static_cast<uint16_t>(imm));
+
+            try {
+                std::string before = result;
+                result = std::regex_replace(result, captureRegex, replacement);
+                if (before != result) {
+                    std::cout << "[DEBUG]   Replaced '" << captureName << "' with " << replacement << std::endl;
+                }
             }
-            else {
-                mem.setSize(4);
-                assembler.cmp(mem, static_cast<uint32_t>(imm));
+            catch (const std::regex_error& e) {
+                std::cerr << "[WARNING] Regex error replacing capture: " << e.what() << std::endl;
             }
-            return true;
         }
 
-        return false;
+        if (result != line) {
+            std::cout << "[DEBUG] After capture replacement: " << result << std::endl;
+        }
+
+        return result;
     }
 
-    bool AssemblyEngine::HandleJmp(x86::Assembler& assembler,
-        const std::vector<std::string>& operands,
-        std::map<std::string, Label>& labelMap) {
-        if (operands.size() != 1) return false;
+    std::string AssemblyEngine::ReplaceSymbolReferences(const std::string& line, AssemblyContext& ctx) const {
+        // For now, minimal implementation - symbols are resolved during immediate/memory parsing
+        return line;
+    }
 
-        const std::string& target = operands[0];
-
-        // Check if it's a register
-        x86::Gp reg = ParseRegister(target);
-        if (reg.isValid()) {
-            assembler.jmp(reg);
-            return true;
+    uint32_t AssemblyEngine::ParseScale(const std::string& scaleStr) {
+        try {
+            uint32_t scale = std::stoul(scaleStr);
+            if (scale == 1 || scale == 2 || scale == 4 || scale == 8) {
+                return scale;
+            }
         }
+        catch (...) {}
 
-        // Check if it's an immediate address
-        if (target[0] == '0' && target[1] == 'x') {
-            uint64_t addr = ParseImmediate(target);
-            assembler.jmp(addr);
-            return true;
-        }
+        return 1; // Default scale
+    }
 
-        // It's a label
-        if (labelMap.find(target) == labelMap.end()) {
-            labelMap[target] = assembler.newLabel();
+    bool AssemblyEngine::HandleDataDirective(AssemblyContext& ctx, const std::string& directive,
+        const std::vector<std::string>& values) {
+        for (const auto& value : values) {
+            if (directive == "db") {
+                // Define byte
+                uint8_t byte = static_cast<uint8_t>(ResolveImmediate(ctx, value).value());
+                ctx.assembler.db(byte);
+            }
+            else if (directive == "dw") {
+                // Define word
+                uint16_t word = static_cast<uint16_t>(ResolveImmediate(ctx, value).value());
+                ctx.assembler.dw(word);
+            }
+            else if (directive == "dd") {
+                // Define dword
+                uint32_t dword = static_cast<uint32_t>(ResolveImmediate(ctx, value).value());
+                ctx.assembler.dd(dword);
+            }
+            else if (directive == "dq") {
+                // Define qword
+                uint64_t qword = ResolveImmediate(ctx, value).value();
+                ctx.assembler.dq(qword);
+            }
         }
-        assembler.jmp(labelMap[target]);
         return true;
     }
 
-    bool AssemblyEngine::HandleJcc(x86::Assembler& assembler,
-        asmjit::CondCode cond,
-        const std::vector<std::string>& operands,
-        std::map<std::string, Label>& labelMap) {
-        if (operands.size() != 1) return false;
-
-        const std::string& target = operands[0];
-
-        // It's a label
-        if (labelMap.find(target) == labelMap.end()) {
-            labelMap[target] = assembler.newLabel();
+    bool AssemblyEngine::HandleSpecialInstruction(AssemblyContext& ctx, const std::string& mnemonic,
+        const std::vector<std::string>& operands) {
+        // Handle special CE script instructions
+        if (mnemonic == "nop" && operands.size() == 1) {
+            // Handle "nop X" syntax
+            try {
+                int count = std::stoi(operands[0]);
+                for (int i = 0; i < count; ++i) {
+                    ctx.assembler.nop();
+                }
+                return true;
+            }
+            catch (...) {
+                // Not a number, treat as regular nop
+            }
         }
 
-        // Use generic conditional jump
-        assembler.j(cond, labelMap[target]);
-        return true;
-    }
-
-    bool AssemblyEngine::HandleCall(x86::Assembler& assembler,
-        const std::vector<std::string>& operands,
-        std::map<std::string, Label>& labelMap) {
-        if (operands.size() != 1) return false;
-
-        const std::string& target = operands[0];
-
-        // Check if it's a register
-        x86::Gp reg = ParseRegister(target);
-        if (reg.isValid()) {
-            assembler.call(reg);
-            return true;
-        }
-
-        // Check if it's an immediate address
-        if (target[0] == '0' && target[1] == 'x') {
-            uint64_t addr = ParseImmediate(target);
-            assembler.call(addr);
-            return true;
-        }
-
-        // It's a label
-        if (labelMap.find(target) == labelMap.end()) {
-            labelMap[target] = assembler.newLabel();
-        }
-        assembler.call(labelMap[target]);
-        return true;
-    }
-
-    bool AssemblyEngine::HandleLea(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
-
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
-
-        x86::Gp dstReg = ParseRegister(dst);
-
-        if (dstReg.isValid() && src[0] == '[') {
-            assembler.lea(dstReg, ParseMemory(src));
-            return true;
-        }
+        // Handle other special cases here
 
         return false;
     }
 
-    bool AssemblyEngine::HandleTest(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    std::optional<ByteVector> AssemblyEngine::AssembleInstruction(const std::string& instruction, AddressType address) {
+        AssemblyContext ctx(runtime_.get(), address);
 
-        const std::string& op1 = operands[0];
-        const std::string& op2 = operands[1];
+        std::string processed = PreprocessLine(instruction, ctx);
 
-        x86::Gp reg1 = ParseRegister(op1);
-        x86::Gp reg2 = ParseRegister(op2);
-
-        if (reg1.isValid() && reg2.isValid()) {
-            assembler.test(reg1, reg2);
-            return true;
+        if (!ParseAndAssembleInstruction(ctx, processed)) {
+            return std::nullopt;
         }
 
-        if (reg1.isValid() && !reg2.isValid()) {
-            uint64_t imm = ParseImmediate(op2);
-            assembler.test(reg1, imm);
-            return true;
-        }
+        // Finalize and extract code
+        Error err = ctx.code.flatten();
+        if (err) return std::nullopt;
 
-        return false;
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+        if (buffer.size() == 0) return std::nullopt;
+
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
-    bool AssemblyEngine::HandlePush(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 1) return false;
+    ByteVector AssemblyEngine::GenerateNop(size_t count) {
+        AssemblyContext ctx(runtime_.get());
 
-        const std::string& op = operands[0];
-        x86::Gp reg = ParseRegister(op);
-
-        if (reg.isValid()) {
-            assembler.push(reg);
-            return true;
+        for (size_t i = 0; i < count; ++i) {
+            ctx.assembler.nop();
         }
 
-        // Immediate
-        uint64_t imm = ParseImmediate(op);
-        assembler.push(Imm(imm));
-        return true;
+        ctx.code.flatten();
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
-    bool AssemblyEngine::HandlePop(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 1) return false;
+    ByteVector AssemblyEngine::GenerateJump(AddressType from, AddressType to) {
+        AssemblyContext ctx(runtime_.get(), from);
 
-        const std::string& op = operands[0];
-        x86::Gp reg = ParseRegister(op);
+        int64_t offset = static_cast<int64_t>(to) - static_cast<int64_t>(from) - 5;
 
-        if (reg.isValid()) {
-            assembler.pop(reg);
-            return true;
+        std::cout << "[DEBUG] Generating jump from 0x" << std::hex << from
+            << " to 0x" << to << ", offset=0x" << offset << std::dec << std::endl;
+
+        if (offset >= INT32_MIN && offset <= INT32_MAX) {
+            // Near jump with 32-bit offset
+            ctx.assembler.jmp(imm(to));
+        }
+        else {
+            // Far jump using absolute address
+            // Method 1: Using indirect jump through memory
+            Label dataLabel = ctx.assembler.newLabel();
+            ctx.assembler.jmp(ptr(dataLabel));
+            ctx.assembler.align(AlignMode::kData, 8);
+            ctx.assembler.bind(dataLabel);
+            ctx.assembler.dq(to);
         }
 
-        return false;
+        ctx.code.flatten();
+        ctx.code.resolveUnresolvedLinks();
+
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+        ByteVector result(buffer.data(), buffer.data() + buffer.size());
+
+        std::cout << "[DEBUG] Generated jump code (" << result.size() << " bytes): ";
+        for (size_t i = 0; i < std::min<size_t>(result.size(), 16); ++i) {
+            std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)result[i] << " ";
+        }
+        std::cout << std::dec << std::endl;
+
+        return result;
     }
 
-    bool AssemblyEngine::HandleAdd(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    ByteVector AssemblyEngine::GenerateCall(AddressType from, AddressType to) {
+        AssemblyContext ctx(runtime_.get(), from);
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
+        int64_t offset = static_cast<int64_t>(to) - static_cast<int64_t>(from) - 5;
 
-        x86::Gp dstReg = ParseRegister(dst);
-        x86::Gp srcReg = ParseRegister(src);
-
-        if (dstReg.isValid() && srcReg.isValid()) {
-            assembler.add(dstReg, srcReg);
-            return true;
+        if (offset >= INT32_MIN && offset <= INT32_MAX) {
+            // Near call
+            ctx.assembler.call(imm(to));
+        }
+        else {
+            // Far call
+            ctx.assembler.mov(rax, imm(to));
+            ctx.assembler.call(rax);
         }
 
-        if (dstReg.isValid() && !srcReg.isValid()) {
-            uint64_t imm = ParseImmediate(src);
-            assembler.add(dstReg, imm);
-            return true;
-        }
+        ctx.code.flatten();
+        ctx.code.resolveUnresolvedLinks();
 
-        return false;
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
-    bool AssemblyEngine::HandleSub(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    ByteVector AssemblyEngine::GenerateDetour(AddressType from, AddressType to, size_t& trampolineSize) {
+        // Generate a jump and ensure minimum size
+        ByteVector jump = GenerateJump(from, to);
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
+        trampolineSize = max(jump.size(), size_t(5));
 
-        x86::Gp dstReg = ParseRegister(dst);
-        x86::Gp srcReg = ParseRegister(src);
-
-        if (dstReg.isValid() && srcReg.isValid()) {
-            assembler.sub(dstReg, srcReg);
-            return true;
+        // Pad with NOPs if needed
+        while (jump.size() < trampolineSize) {
+            jump.push_back(0x90);
         }
 
-        if (dstReg.isValid() && !srcReg.isValid()) {
-            uint64_t imm = ParseImmediate(src);
-            assembler.sub(dstReg, imm);
-            return true;
+        return jump;
+    }
+
+    std::optional<AssemblyEngine::HookInfo> AssemblyEngine::CreateHook(
+        AddressType targetAddress,
+        const std::string& hookCode) {
+
+        HookInfo hook;
+        hook.targetAddress = targetAddress;
+
+        // Assemble hook code
+        auto assembled = Assemble(hookCode);
+        if (!assembled) {
+            return std::nullopt;
         }
 
-        return false;
+        hook.hookBytes = assembled->machineCode;
+
+        // Additional hook setup would go here
+
+        return hook;
+    }
+
+    ByteVector AssemblyEngine::GeneratePushAll() {
+        AssemblyContext ctx(runtime_.get());
+
+        // Push all general purpose registers
+        ctx.assembler.push(rax);
+        ctx.assembler.push(rbx);
+        ctx.assembler.push(rcx);
+        ctx.assembler.push(rdx);
+        ctx.assembler.push(rsi);
+        ctx.assembler.push(rdi);
+        ctx.assembler.push(rbp);
+        ctx.assembler.push(r8);
+        ctx.assembler.push(r9);
+        ctx.assembler.push(r10);
+        ctx.assembler.push(r11);
+        ctx.assembler.push(r12);
+        ctx.assembler.push(r13);
+        ctx.assembler.push(r14);
+        ctx.assembler.push(r15);
+
+        // Push flags
+        ctx.assembler.pushf();
+
+        ctx.code.flatten();
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
+    }
+
+    ByteVector AssemblyEngine::GeneratePopAll() {
+        AssemblyContext ctx(runtime_.get());
+
+        // Pop in reverse order
+        ctx.assembler.popf();
+        ctx.assembler.pop(r15);
+        ctx.assembler.pop(r14);
+        ctx.assembler.pop(r13);
+        ctx.assembler.pop(r12);
+        ctx.assembler.pop(r11);
+        ctx.assembler.pop(r10);
+        ctx.assembler.pop(r9);
+        ctx.assembler.pop(r8);
+        ctx.assembler.pop(rbp);
+        ctx.assembler.pop(rdi);
+        ctx.assembler.pop(rsi);
+        ctx.assembler.pop(rdx);
+        ctx.assembler.pop(rcx);
+        ctx.assembler.pop(rbx);
+        ctx.assembler.pop(rax);
+
+        ctx.code.flatten();
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
+    }
+
+    ByteVector AssemblyEngine::GeneratePrologue(size_t stackSpace) {
+        AssemblyContext ctx(runtime_.get());
+
+        ctx.assembler.push(rbp);
+        ctx.assembler.mov(rbp, rsp);
+
+        if (stackSpace > 0) {
+            ctx.assembler.sub(rsp, stackSpace);
+        }
+
+        ctx.code.flatten();
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
+    }
+
+    ByteVector AssemblyEngine::GenerateEpilogue() {
+        AssemblyContext ctx(runtime_.get());
+
+        ctx.assembler.mov(rsp, rbp);
+        ctx.assembler.pop(rbp);
+        ctx.assembler.ret();
+
+        ctx.code.flatten();
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
 } // namespace AsmEngine

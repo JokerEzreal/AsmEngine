@@ -5,90 +5,115 @@
 #include "CaptureStorage.h"
 #include <asmjit/asmjit.h>
 #include <memory>
-#include <map>
+
 namespace AsmEngine {
 
-    // Assembly instruction info
-    struct AssemblyInstruction {
-        std::string mnemonic;
-        std::vector<std::string> operands;
-        AddressType address;
-        ByteVector machineCode;
+    // Assembly context for managing labels and symbols during assembly
+    class AssemblyContext {
+    public:
+        asmjit::CodeHolder code;
+        asmjit::x86::Assembler assembler;
+        std::unordered_map<std::string, asmjit::Label> labels;
+        std::unordered_map<std::string, AddressType> resolvedAddresses;
+        AddressType baseAddress;
+
+        AssemblyContext(asmjit::JitRuntime* runtime, AddressType base = 0);
+
+        // Label management
+        asmjit::Label GetOrCreateLabel(const std::string& name);
+        void BindLabel(const std::string& name);
+
+        // Symbol resolution
+        asmjit::Imm ResolveImmediate(const std::string& value);
     };
 
     // Assembled code result
     struct AssembledCode {
         ByteVector machineCode;
         std::unordered_map<std::string, AddressType> labels;
-        std::vector<AssemblyInstruction> instructions;
         size_t codeSize = 0;
     };
 
     class AssemblyEngine {
     private:
-        // AsmJit instruction assembly
-        bool AssembleInstructionAsmJit(asmjit::x86::Assembler& assembler,
-            const std::string& instruction,
-            std::map<std::string, asmjit::Label>& labelMap,
-            std::vector<std::pair<size_t, std::string>>& jumpFixups);
+        std::unique_ptr<asmjit::JitRuntime> runtime_;
+        SymbolManager* symbolManager_;
+        CaptureStorage* captureStorage_;
 
-        // Register parsing
-        asmjit::x86::Gp ParseRegister(const std::string& str);
-        asmjit::x86::Xmm ParseXmmRegister(const std::string& str);
+        // Enhanced parsing with asmjit
+        bool ParseAndAssembleInstruction(
+            AssemblyContext& ctx,
+            const std::string& instruction);
 
-        // Memory and immediate parsing
-        asmjit::x86::Mem ParseMemory(const std::string& str);
-        uint64_t ParseImmediate(const std::string& str);
+        // Memory operand parsing using asmjit
+        asmjit::x86::Mem ParseMemoryOperand(
+            AssemblyContext& ctx,
+            const std::string& memExpr);
 
-        // Instruction handlers
-        bool HandleMov(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandleMovss(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandleLea(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandleAdd(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandleSub(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandleTest(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandleCmp(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandlePush(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandlePop(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
-        bool HandleJmp(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands,
-            std::map<std::string, asmjit::Label>& labelMap);
-        bool HandleCall(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands,
-            std::map<std::string, asmjit::Label>& labelMap);
+        // Register parsing using asmjit
+        asmjit::x86::Gp ParseGpRegister(const std::string& regName);
+        asmjit::x86::Xmm ParseXmmRegister(const std::string& regName);
+        asmjit::x86::Mm ParseMmRegister(const std::string& regName);
+
+        // Immediate value resolution
+        asmjit::Imm ResolveImmediate(
+            AssemblyContext& ctx,
+            const std::string& value);
+
+        // Enhanced preprocessing
+        std::string PreprocessLine(
+            const std::string& line,
+            AssemblyContext& ctx) const;
+
+        // Replace capture references
+        std::string ReplaceCaptureReferences(const std::string& line) const;
+
+        // Replace symbol references
+        std::string ReplaceSymbolReferences(
+            const std::string& line,
+            AssemblyContext& ctx) const;
+
+        // Parse scale factor in memory expressions
+        uint32_t ParseScale(const std::string& scaleStr);
+
+        // Handle data directives
+        bool HandleDataDirective(
+            AssemblyContext& ctx,
+            const std::string& directive,
+            const std::vector<std::string>& values);
+
+        // Handle special instructions
+        bool HandleSpecialInstruction(
+            AssemblyContext& ctx,
+            const std::string& mnemonic,
+            const std::vector<std::string>& operands);
 
     public:
         AssemblyEngine(SymbolManager* symbolManager, CaptureStorage* captureStorage);
         ~AssemblyEngine();
 
-        // Assemble code at specific address
-        std::optional<AssembledCode> Assemble(const std::string& assembly,
+        // Get runtime for direct access if needed
+        asmjit::JitRuntime* GetRuntime() { return runtime_.get(); }
+
+        // Main assembly functions
+        std::optional<AssembledCode> Assemble(
+            const std::string& assembly,
             AddressType address = 0);
 
-        // Assemble single instruction
-        std::optional<ByteVector> AssembleInstruction(const std::string& instruction,
+        std::optional<ByteVector> AssembleInstruction(
+            const std::string& instruction,
             AddressType address = 0);
 
-        // Disassemble machine code
-        std::vector<AssemblyInstruction> Disassemble(const ByteVector& machineCode,
-            AddressType address = 0);
-
-        // Generate common code patterns
+        // Code generation utilities using asmjit
         ByteVector GenerateNop(size_t count);
         ByteVector GenerateJump(AddressType from, AddressType to);
         ByteVector GenerateCall(AddressType from, AddressType to);
-        ByteVector GenerateDetour(AddressType from, AddressType to,
-            AddressType& trampolineSize);
+        ByteVector GenerateDetour(
+            AddressType from,
+            AddressType to,
+            size_t& trampolineSize);
 
-        // Code cave utilities
-        struct CodeCave {
-            AddressType address;
-            size_t size;
-            ByteVector originalBytes;
-        };
-
-        std::optional<CodeCave> FindCodeCave(AddressType nearAddress,
-            size_t minSize) const;
-
-        // Hook generation
+        // Hook generation with asmjit
         struct HookInfo {
             AddressType targetAddress;
             AddressType hookAddress;
@@ -97,13 +122,17 @@ namespace AsmEngine {
             AddressType trampolineAddress;
         };
 
-        std::optional<HookInfo> CreateHook(AddressType targetAddress,
+        std::optional<HookInfo> CreateHook(
+            AddressType targetAddress,
             const std::string& hookCode);
 
-        // Inline assembly execution (for testing)
-        std::optional<std::vector<uint64_t>> ExecuteAssembly(
-            const std::string& assembly,
-            const std::vector<uint64_t>& parameters = {});
+        // Generate push/pop for all registers
+        ByteVector GeneratePushAll();
+        ByteVector GeneratePopAll();
+
+        // Generate function prologue/epilogue
+        ByteVector GeneratePrologue(size_t stackSpace = 0);
+        ByteVector GenerateEpilogue();
     };
 
 } // namespace AsmEngine

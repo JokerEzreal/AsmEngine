@@ -1,44 +1,73 @@
-﻿// Enhanced AssemblyEngine.cpp using AsmJit
-#include "AssemblyEngine.h"
-#include "InstructionParser.h"
+﻿#include "AssemblyEngine.h"
 #include <regex>
 #include <sstream>
-#include <asmjit/x86.h>
 #include <iostream>
-#include <iomanip>
 
 namespace AsmEngine {
 
     using namespace asmjit;
+    using namespace asmjit::x86;
 
-    AssemblyEngine::AssemblyEngine(SymbolManager* symbolManager,
-        CaptureStorage* captureStorage)
+    // AssemblyContext implementation
+    AssemblyContext::AssemblyContext(JitRuntime* runtime, AddressType base)
+        : assembler(&code), baseAddress(base) {
+
+        code.init(runtime->environment());
+
+        // Set base address if provided
+        if (base != 0) {
+            code.setBaseAddress(base);
+        }
+    }
+
+    Label AssemblyContext::GetOrCreateLabel(const std::string& name) {
+        auto it = labels.find(name);
+        if (it != labels.end()) {
+            return it->second;
+        }
+
+        Label label = assembler.newLabel();
+        labels[name] = label;
+        return label;
+    }
+
+    void AssemblyContext::BindLabel(const std::string& name) {
+        Label label = GetOrCreateLabel(name);
+        assembler.bind(label);
+
+        // Store resolved address
+        resolvedAddresses[name] = baseAddress + assembler.offset();
+    }
+
+    Imm AssemblyContext::ResolveImmediate(const std::string& value) {
+        // Parse hex, decimal, or symbol
+        if (value.size() > 2 && value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+            // Hex value
+            uint64_t val = std::stoull(value, nullptr, 16);
+            return imm(val);
+        }
+        else if (std::all_of(value.begin(), value.end(), ::isdigit)) {
+            // Decimal value
+            uint64_t val = std::stoull(value);
+            return imm(val);
+        }
+
+        // Could be a symbol - return 0 for now
+        return imm(0);
+    }
+
+    // AssemblyEngine implementation
+    AssemblyEngine::AssemblyEngine(SymbolManager* symbolManager, CaptureStorage* captureStorage)
         : symbolManager_(symbolManager), captureStorage_(captureStorage) {
 
-        // Initialize AsmJit runtime
         runtime_ = std::make_unique<JitRuntime>();
     }
 
     AssemblyEngine::~AssemblyEngine() = default;
 
-    // Enhanced assembly method that handles labels and multiple instructions
-    std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly,
-        AddressType baseAddress) {
+    std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly, AddressType address) {
+        AssemblyContext ctx(runtime_.get(), address);
 
-        AssembledCode result;
-
-        // Create code holder and assembler
-        CodeHolder code;
-        code.init(runtime_->environment(), baseAddress);
-
-        x86::Assembler assembler(&code);
-
-        // Label management
-        std::map<std::string, Label> labelMap;
-        std::map<std::string, std::vector<size_t>> unresolvedJumps;
-        std::vector<std::pair<size_t, std::string>> jumpFixups;
-
-        // Parse assembly line by line
         std::istringstream stream(assembly);
         std::string line;
 
@@ -47,756 +76,696 @@ namespace AsmEngine {
             line.erase(0, line.find_first_not_of(" \t"));
             line.erase(line.find_last_not_of(" \t") + 1);
 
-            // Skip empty lines and comments
             if (line.empty() || line[0] == ';') {
                 continue;
             }
 
-            // Check for labels
+            // Check for label definition
             if (line.back() == ':') {
                 std::string labelName = line.substr(0, line.length() - 1);
+                ctx.BindLabel(labelName);
 
-                // Create or get label
-                if (labelMap.find(labelName) == labelMap.end()) {
-                    labelMap[labelName] = assembler.newLabel();
+                // Register in symbol manager if available
+                if (symbolManager_) {
+                    symbolManager_->RegisterLabel(labelName,
+                        address + ctx.assembler.offset());
                 }
-
-                // Bind label to current position
-                assembler.bind(labelMap[labelName]);
-
-                // Store label address
-                result.labels[labelName] = baseAddress + assembler.offset();
-
                 continue;
             }
 
-            // Preprocess the line
-            std::string processed = PreprocessAssembly(line, baseAddress + assembler.offset());
-
-            // Assemble the instruction
-            if (!AssembleInstructionAsmJit(assembler, processed, labelMap, jumpFixups)) {
-                std::cout << "[ERROR] Failed to assemble: " << line << std::endl;
-                std::cout << "[DEBUG] Processed: " << processed << std::endl;
+            // Preprocess and assemble instruction
+            std::string processed = PreprocessLine(line, ctx);
+            if (!ParseAndAssembleInstruction(ctx, processed)) {
+                std::cerr << "[ERROR] Failed to assemble: " << line << std::endl;
+                return std::nullopt;
             }
         }
 
-        // Finalize the code
-        Error err = code.flatten();
+        // Finalize code
+        Error err = ctx.code.flatten();
         if (err) {
-            std::cout << "[ERROR] Failed to flatten code: " << DebugUtils::errorAsString(err) << std::endl;
+            std::cerr << "[ERROR] Failed to flatten code" << std::endl;
             return std::nullopt;
         }
 
-        err = code.resolveUnresolvedLinks();
+        err = ctx.code.resolveUnresolvedLinks();
         if (err) {
-            std::cout << "[ERROR] Failed to resolve links: " << DebugUtils::errorAsString(err) << std::endl;
+            std::cerr << "[ERROR] Failed to resolve links" << std::endl;
             return std::nullopt;
         }
 
-        // Get the assembled code
-        CodeBuffer& buffer = code.sectionById(0)->buffer();
-        if (buffer.size() == 0) {
-            return std::nullopt;
-        }
-
+        // Extract machine code
+        AssembledCode result;
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
         result.machineCode.assign(buffer.data(), buffer.data() + buffer.size());
         result.codeSize = buffer.size();
+        result.labels = ctx.resolvedAddresses;
 
         return result;
     }
 
-    // Enhanced instruction assembler using AsmJit
-    bool AssemblyEngine::AssembleInstructionAsmJit(x86::Assembler& assembler,
-        const std::string& instruction,
-        std::map<std::string, Label>& labelMap,
-        std::vector<std::pair<size_t, std::string>>& jumpFixups) {
-
-        // Parse instruction
+    bool AssemblyEngine::ParseAndAssembleInstruction(AssemblyContext& ctx, const std::string& instruction) {
         std::istringstream iss(instruction);
         std::string mnemonic;
         iss >> mnemonic;
 
-        // Convert to lowercase
+        // Convert to lowercase for comparison
         std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(), ::tolower);
 
-        // Get operands
-        std::string operandsStr;
-        std::getline(iss, operandsStr);
+        try {
+            // MOV instruction
+            if (mnemonic == "mov") {
+                std::string op1, op2;
+                if (!(iss >> op1)) return false;
 
-        // Parse operands
-        std::vector<std::string> operands;
-        if (!operandsStr.empty()) {
-            operandsStr.erase(0, operandsStr.find_first_not_of(" \t"));
+                // Skip comma
+                if (iss.peek() == ',') iss.get();
 
-            std::string current;
-            bool inBrackets = false;
+                if (!(iss >> op2)) return false;
 
-            for (char c : operandsStr) {
-                if (c == '[') inBrackets = true;
-                else if (c == ']') inBrackets = false;
+                // Parse operands
+                if (op1[0] == '[') {
+                    // Memory destination
+                    Mem mem = ParseMemoryOperand(ctx, op1);
 
-                if (c == ',' && !inBrackets) {
-                    if (!current.empty()) {
-                        // Trim
-                        current.erase(0, current.find_first_not_of(" \t"));
-                        current.erase(current.find_last_not_of(" \t") + 1);
-                        operands.push_back(current);
-                        current.clear();
+                    if (op2[0] == '[') {
+                        // mov [mem], [mem] - not directly supported
+                        return false;
                     }
-                }
-                else {
-                    current += c;
-                }
-            }
-
-            if (!current.empty()) {
-                current.erase(0, current.find_first_not_of(" \t"));
-                current.erase(current.find_last_not_of(" \t") + 1);
-                operands.push_back(current);
-            }
-        }
-
-        // Handle different instructions
-        if (mnemonic == "push") {
-            return HandlePush(assembler, operands);
-        }
-        else if (mnemonic == "pop") {
-            return HandlePop(assembler, operands);
-        }
-        else if (mnemonic == "mov") {
-            return HandleMov(assembler, operands);
-        }
-        else if (mnemonic == "movss") {
-            return HandleMovss(assembler, operands);
-        }
-        else if (mnemonic == "lea") {
-            return HandleLea(assembler, operands);
-        }
-        else if (mnemonic == "add") {
-            return HandleAdd(assembler, operands);
-        }
-        else if (mnemonic == "sub") {
-            return HandleSub(assembler, operands);
-        }
-        else if (mnemonic == "test") {
-            return HandleTest(assembler, operands);
-        }
-        else if (mnemonic == "cmp") {
-            return HandleCmp(assembler, operands);
-        }
-        else if (mnemonic == "jmp") {
-            return HandleJmp(assembler, operands, labelMap);
-        }
-        else if (mnemonic == "call") {
-            return HandleCall(assembler, operands, labelMap);
-        }
-        else if (mnemonic == "je" || mnemonic == "jz") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.je(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jne" || mnemonic == "jnz") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jne(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jg") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jg(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jge") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jge(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jl") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jl(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jle") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jle(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "ja") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.ja(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jae" || mnemonic == "jnc") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jae(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jb" || mnemonic == "jc") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jb(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "jbe") {
-            if (operands.size() != 1) return false;
-            const std::string& target = operands[0];
-            if (labelMap.find(target) == labelMap.end()) {
-                labelMap[target] = assembler.newLabel();
-            }
-            assembler.jbe(labelMap[target]);
-            return true;
-        }
-        else if (mnemonic == "nop") {
-            assembler.nop();
-            return true;
-        }
-        else if (mnemonic == "ret") {
-            assembler.ret();
-            return true;
-        }
-
-        return false;
-    }
-
-    // Parse register
-    x86::Gp AssemblyEngine::ParseRegister(const std::string& str) {
-        using namespace asmjit::x86;
-
-        // 64-bit registers
-        if (str == "rax") return rax;
-        if (str == "rbx") return rbx;
-        if (str == "rcx") return rcx;
-        if (str == "rdx") return rdx;
-        if (str == "rsi") return rsi;
-        if (str == "rdi") return rdi;
-        if (str == "rbp") return rbp;
-        if (str == "rsp") return rsp;
-        if (str == "r8") return r8;
-        if (str == "r9") return r9;
-        if (str == "r10") return r10;
-        if (str == "r11") return r11;
-        if (str == "r12") return r12;
-        if (str == "r13") return r13;
-        if (str == "r14") return r14;
-        if (str == "r15") return r15;
-
-        // 32-bit registers
-        if (str == "eax") return eax;
-        if (str == "ebx") return ebx;
-        if (str == "ecx") return ecx;
-        if (str == "edx") return edx;
-        if (str == "esi") return esi;
-        if (str == "edi") return edi;
-        if (str == "ebp") return ebp;
-        if (str == "esp") return esp;
-
-        // 16-bit registers
-        if (str == "ax") return ax;
-        if (str == "bx") return bx;
-        if (str == "cx") return cx;
-        if (str == "dx") return dx;
-
-        // 8-bit registers
-        if (str == "al") return al;
-        if (str == "bl") return bl;
-        if (str == "cl") return cl;
-        if (str == "dl") return dl;
-
-        return x86::Gp(); // Invalid
-    }
-
-    // Parse XMM register
-    x86::Xmm AssemblyEngine::ParseXmmRegister(const std::string& str) {
-        using namespace asmjit::x86;
-
-        if (str == "xmm0") return xmm0;
-        if (str == "xmm1") return xmm1;
-        if (str == "xmm2") return xmm2;
-        if (str == "xmm3") return xmm3;
-        if (str == "xmm4") return xmm4;
-        if (str == "xmm5") return xmm5;
-        if (str == "xmm6") return xmm6;
-        if (str == "xmm7") return xmm7;
-
-        return x86::Xmm(); // Invalid
-    }
-
-    // Parse memory operand
-    x86::Mem AssemblyEngine::ParseMemory(const std::string& str) {
-        // Remove brackets
-        std::string expr = str.substr(1, str.length() - 2);
-
-        x86::Gp base;
-        x86::Gp index;
-        uint32_t scale = 1;
-        int32_t disp = 0;
-        bool hasBase = false;
-        bool hasIndex = false;
-
-        // Simple parser for [base+index*scale+disp] format
-        std::regex memRegex(R"(([a-zA-Z0-9]+)?(?:\s*\+\s*([a-zA-Z0-9]+)(?:\s*\*\s*(\d+))?)?(?:\s*([+-])\s*0x([0-9A-Fa-f]+))?(?:\s*([+-])\s*(\d+))?)");
-        std::smatch match;
-
-        // For simple absolute addresses like [0x12345678]
-        if (expr.find_first_of("+-*") == std::string::npos && !ParseRegister(expr).isValid()) {
-            // Pure address
-            uint64_t addr = ParseImmediate(expr);
-            return x86::ptr(addr);
-        }
-
-        // Parse complex expressions
-        std::string token;
-        bool expectOp = false;
-        char lastOp = '+';
-
-        for (size_t i = 0; i < expr.length(); i++) {
-            char c = expr[i];
-
-            if (c == ' ' || c == '\t') continue;
-
-            if (c == '+' || c == '-' || c == '*') {
-                if (!token.empty()) {
-                    // Process token
-                    if (ParseRegister(token).isValid()) {
-                        if (!hasBase) {
-                            base = ParseRegister(token);
-                            hasBase = true;
-                        }
-                        else {
-                            index = ParseRegister(token);
-                            hasIndex = true;
-                        }
+                    else if (ParseGpRegister(op2).isValid()) {
+                        ctx.assembler.mov(mem, ParseGpRegister(op2));
                     }
                     else {
-                        // It's a displacement
-                        int32_t val = ParseImmediate(token);
-                        if (lastOp == '-') val = -val;
-                        disp += val;
+                        // Immediate to memory
+                        Imm imm = ResolveImmediate(ctx, op2);
+                        ctx.assembler.mov(mem, imm);
                     }
-                    token.clear();
                 }
-                lastOp = c;
-                expectOp = false;
-            }
-            else {
-                token += c;
-            }
-        }
+                else if (ParseGpRegister(op1).isValid()) {
+                    // Register destination
+                    Gp reg1 = ParseGpRegister(op1);
 
-        // Process last token
-        if (!token.empty()) {
-            if (ParseRegister(token).isValid()) {
-                if (!hasBase) {
-                    base = ParseRegister(token);
-                    hasBase = true;
+                    if (op2[0] == '[') {
+                        // mov reg, [mem]
+                        Mem mem = ParseMemoryOperand(ctx, op2);
+                        ctx.assembler.mov(reg1, mem);
+                    }
+                    else if (ParseGpRegister(op2).isValid()) {
+                        // mov reg, reg
+                        ctx.assembler.mov(reg1, ParseGpRegister(op2));
+                    }
+                    else {
+                        // mov reg, imm
+                        Imm imm = ResolveImmediate(ctx, op2);
+                        ctx.assembler.mov(reg1, imm);
+                    }
                 }
                 else {
-                    index = ParseRegister(token);
-                    hasIndex = true;
+                    return false;
+                }
+                return true;
+            }
+
+            // JMP instruction
+            else if (mnemonic == "jmp") {
+                std::string target;
+                iss >> target;
+
+                if (ParseGpRegister(target).isValid()) {
+                    // jmp reg
+                    ctx.assembler.jmp(ParseGpRegister(target));
+                }
+                else if (target[0] == '[') {
+                    // jmp [mem]
+                    ctx.assembler.jmp(ParseMemoryOperand(ctx, target));
+                }
+                else {
+                    // jmp label/address
+                    Label label = ctx.GetOrCreateLabel(target);
+                    ctx.assembler.jmp(label);
+                }
+                return true;
+            }
+
+            // CALL instruction
+            else if (mnemonic == "call") {
+                std::string target;
+                iss >> target;
+
+                if (ParseGpRegister(target).isValid()) {
+                    ctx.assembler.call(ParseGpRegister(target));
+                }
+                else if (target[0] == '[') {
+                    ctx.assembler.call(ParseMemoryOperand(ctx, target));
+                }
+                else {
+                    Label label = ctx.GetOrCreateLabel(target);
+                    ctx.assembler.call(label);
+                }
+                return true;
+            }
+
+            // PUSH/POP
+            else if (mnemonic == "push") {
+                std::string op;
+                iss >> op;
+
+                if (ParseGpRegister(op).isValid()) {
+                    ctx.assembler.push(ParseGpRegister(op));
+                }
+                else if (op[0] == '[') {
+                    ctx.assembler.push(ParseMemoryOperand(ctx, op));
+                }
+                else {
+                    ctx.assembler.push(ResolveImmediate(ctx, op));
+                }
+                return true;
+            }
+            else if (mnemonic == "pop") {
+                std::string op;
+                iss >> op;
+
+                if (ParseGpRegister(op).isValid()) {
+                    ctx.assembler.pop(ParseGpRegister(op));
+                }
+                else if (op[0] == '[') {
+                    ctx.assembler.pop(ParseMemoryOperand(ctx, op));
+                }
+                return true;
+            }
+
+            // ADD/SUB
+            else if (mnemonic == "add" || mnemonic == "sub") {
+                std::string op1, op2;
+                iss >> op1;
+                if (iss.peek() == ',') iss.get();
+                iss >> op2;
+
+                if (ParseGpRegister(op1).isValid()) {
+                    Gp reg = ParseGpRegister(op1);
+
+                    if (ParseGpRegister(op2).isValid()) {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(reg, ParseGpRegister(op2));
+                        else
+                            ctx.assembler.sub(reg, ParseGpRegister(op2));
+                    }
+                    else if (op2[0] == '[') {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(reg, ParseMemoryOperand(ctx, op2));
+                        else
+                            ctx.assembler.sub(reg, ParseMemoryOperand(ctx, op2));
+                    }
+                    else {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(reg, ResolveImmediate(ctx, op2));
+                        else
+                            ctx.assembler.sub(reg, ResolveImmediate(ctx, op2));
+                    }
+                }
+                else if (op1[0] == '[') {
+                    Mem mem = ParseMemoryOperand(ctx, op1);
+
+                    if (ParseGpRegister(op2).isValid()) {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(mem, ParseGpRegister(op2));
+                        else
+                            ctx.assembler.sub(mem, ParseGpRegister(op2));
+                    }
+                    else {
+                        if (mnemonic == "add")
+                            ctx.assembler.add(mem, ResolveImmediate(ctx, op2));
+                        else
+                            ctx.assembler.sub(mem, ResolveImmediate(ctx, op2));
+                    }
+                }
+                return true;
+            }
+
+            // LEA
+            else if (mnemonic == "lea") {
+                std::string op1, op2;
+                iss >> op1;
+                if (iss.peek() == ',') iss.get();
+                iss >> op2;
+
+                if (ParseGpRegister(op1).isValid() && op2[0] == '[') {
+                    ctx.assembler.lea(ParseGpRegister(op1), ParseMemoryOperand(ctx, op2));
+                    return true;
+                }
+            }
+
+            // TEST/CMP
+            else if (mnemonic == "test" || mnemonic == "cmp") {
+                std::string op1, op2;
+                iss >> op1;
+                if (iss.peek() == ',') iss.get();
+                iss >> op2;
+
+                if (ParseGpRegister(op1).isValid()) {
+                    Gp reg = ParseGpRegister(op1);
+
+                    if (ParseGpRegister(op2).isValid()) {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(reg, ParseGpRegister(op2));
+                        else
+                            ctx.assembler.cmp(reg, ParseGpRegister(op2));
+                    }
+                    else if (op2[0] == '[') {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(reg, ParseMemoryOperand(ctx, op2));
+                        else
+                            ctx.assembler.cmp(reg, ParseMemoryOperand(ctx, op2));
+                    }
+                    else {
+                        if (mnemonic == "test")
+                            ctx.assembler.test(reg, ResolveImmediate(ctx, op2));
+                        else
+                            ctx.assembler.cmp(reg, ResolveImmediate(ctx, op2));
+                    }
+                }
+                return true;
+            }
+
+            // Conditional jumps
+            else if (mnemonic == "je" || mnemonic == "jz") {
+                std::string target;
+                iss >> target;
+                ctx.assembler.je(ctx.GetOrCreateLabel(target));
+                return true;
+            }
+            else if (mnemonic == "jne" || mnemonic == "jnz") {
+                std::string target;
+                iss >> target;
+                ctx.assembler.jne(ctx.GetOrCreateLabel(target));
+                return true;
+            }
+            else if (mnemonic == "jg") {
+                std::string target;
+                iss >> target;
+                ctx.assembler.jg(ctx.GetOrCreateLabel(target));
+                return true;
+            }
+            else if (mnemonic == "jl") {
+                std::string target;
+                iss >> target;
+                ctx.assembler.jl(ctx.GetOrCreateLabel(target));
+                return true;
+            }
+
+            // RET
+            else if (mnemonic == "ret") {
+                ctx.assembler.ret();
+                return true;
+            }
+
+            // NOP
+            else if (mnemonic == "nop") {
+                ctx.assembler.nop();
+                return true;
+            }
+
+            // SSE instructions
+            else if (mnemonic == "movss") {
+                std::string op1, op2;
+                iss >> op1;
+                if (iss.peek() == ',') iss.get();
+                iss >> op2;
+
+                if (ParseXmmRegister(op1).isValid()) {
+                    Xmm xmm = ParseXmmRegister(op1);
+
+                    if (op2[0] == '[') {
+                        ctx.assembler.movss(xmm, ParseMemoryOperand(ctx, op2));
+                    }
+                    else if (ParseXmmRegister(op2).isValid()) {
+                        ctx.assembler.movss(xmm, ParseXmmRegister(op2));
+                    }
+                }
+                else if (op1[0] == '[' && ParseXmmRegister(op2).isValid()) {
+                    ctx.assembler.movss(ParseMemoryOperand(ctx, op1), ParseXmmRegister(op2));
+                }
+                return true;
+            }
+        }
+        catch (const std::exception& e) {
+            std::cerr << "[ERROR] Assembly exception: " << e.what() << std::endl;
+            return false;
+        }
+
+        std::cerr << "[WARNING] Unhandled mnemonic: " << mnemonic << std::endl;
+        return false;
+    }
+
+    Mem AssemblyEngine::ParseMemoryOperand(AssemblyContext& ctx, const std::string& memExpr) {
+        // Remove brackets
+        std::string expr = memExpr;
+        if (expr.front() == '[') expr = expr.substr(1);
+        if (expr.back() == ']') expr.pop_back();
+
+        // Parse components: base + index*scale + displacement
+        Gp base;
+        Gp index;
+        uint32_t scale = 0;
+        int32_t displacement = 0;
+
+        // Simple parsing - this could be enhanced
+        std::istringstream iss(expr);
+        std::string token;
+        bool expectingOperator = false;
+        bool lastWasPlus = true;
+
+        while (iss >> token) {
+            if (token == "+" || token == "-") {
+                lastWasPlus = (token == "+");
+                expectingOperator = false;
+            }
+            else if (token == "*") {
+                // Next token should be scale
+                if (iss >> token) {
+                    scale = std::stoul(token);
+                }
+            }
+            else if (ParseGpRegister(token).isValid()) {
+                Gp reg = ParseGpRegister(token);
+
+                if (!base.isValid()) {
+                    base = reg;
+                }
+                else if (!index.isValid()) {
+                    index = reg;
                 }
             }
             else {
-                int32_t val = ParseImmediate(token);
-                if (lastOp == '-') val = -val;
-                disp += val;
+                // Must be a displacement or immediate
+                int32_t value = 0;
+
+                // Resolve symbol or parse number
+                if (symbolManager_) {
+                    auto addr = symbolManager_->ResolveAddress(token);
+                    if (addr) {
+                        value = static_cast<int32_t>(*addr);
+                    }
+                    else {
+                        value = static_cast<int32_t>(ResolveImmediate(ctx, token).value());
+                    }
+                }
+                else {
+                    value = static_cast<int32_t>(ResolveImmediate(ctx, token).value());
+                }
+
+                displacement += (lastWasPlus ? value : -value);
             }
         }
 
-        // Create memory operand
-        if (hasBase && hasIndex) {
-            return x86::ptr(base, index, scale, disp);
+        // Build memory operand
+        if (base.isValid() && index.isValid() && scale > 0) {
+            return ptr(base, index, scale, displacement);
         }
-        else if (hasBase) {
-            return x86::ptr(base, disp);
+        else if (base.isValid() && index.isValid()) {
+            return ptr(base, index, 0, displacement);
+        }
+        else if (base.isValid()) {
+            return ptr(base, displacement);
         }
         else {
-            return x86::ptr(disp);
+            // Absolute address
+            return ptr(static_cast<uint64_t>(displacement));
         }
     }
 
-    // Parse immediate value
-    uint64_t AssemblyEngine::ParseImmediate(const std::string& str) {
-        if (str.empty()) return 0;
+    Gp AssemblyEngine::ParseGpRegister(const std::string& regName) {
+        std::string lower = regName;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-        // Handle hex
-        if (str.size() > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
-            return std::stoull(str, nullptr, 16);
-        }
+        // 64-bit registers
+        if (lower == "rax") return rax;
+        if (lower == "rbx") return rbx;
+        if (lower == "rcx") return rcx;
+        if (lower == "rdx") return rdx;
+        if (lower == "rsi") return rsi;
+        if (lower == "rdi") return rdi;
+        if (lower == "rbp") return rbp;
+        if (lower == "rsp") return rsp;
+        if (lower == "r8")  return r8;
+        if (lower == "r9")  return r9;
+        if (lower == "r10") return r10;
+        if (lower == "r11") return r11;
+        if (lower == "r12") return r12;
+        if (lower == "r13") return r13;
+        if (lower == "r14") return r14;
+        if (lower == "r15") return r15;
 
-        // Default to decimal
-        return std::stoull(str, nullptr, 10);
+        // 32-bit registers
+        if (lower == "eax") return eax;
+        if (lower == "ebx") return ebx;
+        if (lower == "ecx") return ecx;
+        if (lower == "edx") return edx;
+        if (lower == "esi") return esi;
+        if (lower == "edi") return edi;
+        if (lower == "ebp") return ebp;
+        if (lower == "esp") return esp;
+        if (lower == "r8d")  return r8d;
+        if (lower == "r9d")  return r9d;
+        if (lower == "r10d") return r10d;
+        if (lower == "r11d") return r11d;
+        if (lower == "r12d") return r12d;
+        if (lower == "r13d") return r13d;
+        if (lower == "r14d") return r14d;
+        if (lower == "r15d") return r15d;
+
+        // Return invalid register
+        return Gp();
     }
 
-    // Instruction handlers
-    bool AssemblyEngine::HandleMov(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    Xmm AssemblyEngine::ParseXmmRegister(const std::string& regName) {
+        std::string lower = regName;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
+        if (lower == "xmm0")  return xmm0;
+        if (lower == "xmm1")  return xmm1;
+        if (lower == "xmm2")  return xmm2;
+        if (lower == "xmm3")  return xmm3;
+        if (lower == "xmm4")  return xmm4;
+        if (lower == "xmm5")  return xmm5;
+        if (lower == "xmm6")  return xmm6;
+        if (lower == "xmm7")  return xmm7;
+        if (lower == "xmm8")  return xmm8;
+        if (lower == "xmm9")  return xmm9;
+        if (lower == "xmm10") return xmm10;
+        if (lower == "xmm11") return xmm11;
+        if (lower == "xmm12") return xmm12;
+        if (lower == "xmm13") return xmm13;
+        if (lower == "xmm14") return xmm14;
+        if (lower == "xmm15") return xmm15;
 
-        // reg, reg
-        x86::Gp dstReg = ParseRegister(dst);
-        x86::Gp srcReg = ParseRegister(src);
+        return Xmm();
+    }
 
-        if (dstReg.isValid() && srcReg.isValid()) {
-            assembler.mov(dstReg, srcReg);
-            return true;
-        }
-
-        // reg, imm
-        if (dstReg.isValid() && !srcReg.isValid() && src[0] != '[') {
-            uint64_t imm = ParseImmediate(src);
-            assembler.mov(dstReg, imm);
-            return true;
-        }
-
-        // reg, mem
-        if (dstReg.isValid() && src[0] == '[') {
-            assembler.mov(dstReg, ParseMemory(src));
-            return true;
-        }
-
-        // mem, reg
-        if (dst[0] == '[' && srcReg.isValid()) {
-            assembler.mov(ParseMemory(dst), srcReg);
-            return true;
-        }
-
-        // mem, imm - special handling
-        if (dst[0] == '[' && !srcReg.isValid() && src[0] != '[') {
-            x86::Mem mem = ParseMemory(dst);
-            uint64_t imm = ParseImmediate(src);
-
-            // Determine size based on immediate value
-            if (imm <= 0xFFFFFFFF) {
-                mem.setSize(4); // dword
-                assembler.mov(mem, static_cast<uint32_t>(imm));
+    Imm AssemblyEngine::ResolveImmediate(AssemblyContext& ctx, const std::string& value) {
+        // First try to resolve from captures
+        if (captureStorage_ && captureStorage_->Exists(value)) {
+            auto capture = captureStorage_->Get(value);
+            if (capture) {
+                switch (capture->size) {
+                case 1: return imm(capture->AsUInt8());
+                case 2: return imm(capture->AsUInt16());
+                case 4: return imm(capture->AsUInt32());
+                case 8: return imm(capture->AsUInt64());
+                }
             }
-            else {
-                // For 64-bit immediates, we need to use a temporary register
-                assembler.push(x86::rax);
-                assembler.mov(x86::rax, imm);
-                assembler.mov(mem, x86::rax);
-                assembler.pop(x86::rax);
+        }
+
+        // Then try symbols
+        if (symbolManager_) {
+            auto addr = symbolManager_->ResolveAddress(value);
+            if (addr) {
+                return imm(*addr);
             }
-            return true;
         }
 
-        return false;
+        // Check if it's a float cast
+        if (value.find("(float)") == 0) {
+            std::string floatStr = value.substr(7);
+            float f = std::stof(floatStr);
+            uint32_t bits = *reinterpret_cast<uint32_t*>(&f);
+            return imm(bits);
+        }
+
+        // Parse as number
+        return ctx.ResolveImmediate(value);
     }
 
-    bool AssemblyEngine::HandleMovss(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    std::string AssemblyEngine::PreprocessLine(const std::string& line, AssemblyContext& ctx) const {
+        std::string result = line;
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
+        // Replace capture references
+        result = ReplaceCaptureReferences(result);
 
-        x86::Xmm dstXmm = ParseXmmRegister(dst);
-        x86::Xmm srcXmm = ParseXmmRegister(src);
+        // Replace symbol references
+        result = ReplaceSymbolReferences(result, ctx);
 
-        // xmm, xmm
-        if (dstXmm.isValid() && srcXmm.isValid()) {
-            assembler.movss(dstXmm, srcXmm);
-            return true;
-        }
-
-        // xmm, mem
-        if (dstXmm.isValid() && src[0] == '[') {
-            assembler.movss(dstXmm, ParseMemory(src));
-            return true;
-        }
-
-        // mem, xmm
-        if (dst[0] == '[' && srcXmm.isValid()) {
-            assembler.movss(ParseMemory(dst), srcXmm);
-            return true;
-        }
-
-        return false;
+        return result;
     }
 
-    bool AssemblyEngine::HandleCmp(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
-
-        const std::string& op1 = operands[0];
-        const std::string& op2 = operands[1];
-
-        x86::Gp reg1 = ParseRegister(op1);
-        x86::Gp reg2 = ParseRegister(op2);
-
-        // reg, reg
-        if (reg1.isValid() && reg2.isValid()) {
-            assembler.cmp(reg1, reg2);
-            return true;
+    std::string AssemblyEngine::ReplaceCaptureReferences(const std::string& line) const {
+        if (!captureStorage_) {
+            return line;
         }
 
-        // reg, imm
-        if (reg1.isValid() && !reg2.isValid() && op2[0] != '[') {
-            uint64_t imm = ParseImmediate(op2);
-            assembler.cmp(reg1, imm);
-            return true;
-        }
+        std::string result = line;
+        auto captureNames = captureStorage_->GetAllNames();
 
-        // reg, mem
-        if (reg1.isValid() && op2[0] == '[') {
-            assembler.cmp(reg1, ParseMemory(op2));
-            return true;
-        }
+        // Sort by length descending to replace longer names first
+        std::sort(captureNames.begin(), captureNames.end(),
+            [](const std::string& a, const std::string& b) {
+                return a.length() > b.length();
+            });
 
-        // mem, reg
-        if (op1[0] == '[' && reg2.isValid()) {
-            assembler.cmp(ParseMemory(op1), reg2);
-            return true;
-        }
+        for (const auto& captureName : captureNames) {
+            std::regex captureRegex(R"(\b)" + captureName + R"(\b)");
 
-        // mem, imm
-        if (op1[0] == '[' && !reg2.isValid() && op2[0] != '[') {
-            x86::Mem mem = ParseMemory(op1);
-            uint64_t imm = ParseImmediate(op2);
+            auto capture = captureStorage_->Get(captureName);
+            if (!capture) continue;
 
-            // Set appropriate size
-            if (imm <= 0xFF) {
-                mem.setSize(1);
-                assembler.cmp(mem, static_cast<uint8_t>(imm));
+            std::string replacement;
+            switch (capture->size) {
+            case 1:
+                replacement = "0x" + std::to_string(capture->AsUInt8());
+                break;
+            case 2:
+                replacement = "0x" + std::to_string(capture->AsUInt16());
+                break;
+            case 4:
+                replacement = "0x" + std::to_string(capture->AsUInt32());
+                break;
+            case 8:
+                replacement = "0x" + std::to_string(capture->AsUInt64());
+                break;
             }
-            else if (imm <= 0xFFFF) {
-                mem.setSize(2);
-                assembler.cmp(mem, static_cast<uint16_t>(imm));
-            }
-            else {
-                mem.setSize(4);
-                assembler.cmp(mem, static_cast<uint32_t>(imm));
-            }
-            return true;
+
+            result = std::regex_replace(result, captureRegex, replacement);
         }
 
-        return false;
+        return result;
     }
 
-    bool AssemblyEngine::HandleJmp(x86::Assembler& assembler,
-        const std::vector<std::string>& operands,
-        std::map<std::string, Label>& labelMap) {
-        if (operands.size() != 1) return false;
-
-        const std::string& target = operands[0];
-
-        // Check if it's a register
-        x86::Gp reg = ParseRegister(target);
-        if (reg.isValid()) {
-            assembler.jmp(reg);
-            return true;
-        }
-
-        // Check if it's an immediate address
-        if (target[0] == '0' && target[1] == 'x') {
-            uint64_t addr = ParseImmediate(target);
-            assembler.jmp(addr);
-            return true;
-        }
-
-        // It's a label
-        if (labelMap.find(target) == labelMap.end()) {
-            labelMap[target] = assembler.newLabel();
-        }
-        assembler.jmp(labelMap[target]);
-        return true;
+    std::string AssemblyEngine::ReplaceSymbolReferences(const std::string& line, AssemblyContext& ctx) const {
+        // For now, minimal implementation - symbols are resolved during immediate parsing
+        return line;
     }
 
-    bool AssemblyEngine::HandleJcc(x86::Assembler& assembler,
-        asmjit::CondCode cond,
-        const std::vector<std::string>& operands,
-        std::map<std::string, Label>& labelMap) {
-        if (operands.size() != 1) return false;
+    std::optional<ByteVector> AssemblyEngine::AssembleInstruction(const std::string& instruction, AddressType address) {
+        AssemblyContext ctx(runtime_.get(), address);
 
-        const std::string& target = operands[0];
+        std::string processed = PreprocessLine(instruction, ctx);
 
-        // It's a label
-        if (labelMap.find(target) == labelMap.end()) {
-            labelMap[target] = assembler.newLabel();
+        if (!ParseAndAssembleInstruction(ctx, processed)) {
+            return std::nullopt;
         }
 
-        // Use generic conditional jump
-        assembler.j(cond, labelMap[target]);
-        return true;
+        // Finalize and extract code
+        Error err = ctx.code.flatten();
+        if (err) return std::nullopt;
+
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+        if (buffer.size() == 0) return std::nullopt;
+
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
-    bool AssemblyEngine::HandleCall(x86::Assembler& assembler,
-        const std::vector<std::string>& operands,
-        std::map<std::string, Label>& labelMap) {
-        if (operands.size() != 1) return false;
+    ByteVector AssemblyEngine::GenerateNop(size_t count) {
+        AssemblyContext ctx(runtime_.get());
 
-        const std::string& target = operands[0];
-
-        // Check if it's a register
-        x86::Gp reg = ParseRegister(target);
-        if (reg.isValid()) {
-            assembler.call(reg);
-            return true;
+        for (size_t i = 0; i < count; ++i) {
+            ctx.assembler.nop();
         }
 
-        // Check if it's an immediate address
-        if (target[0] == '0' && target[1] == 'x') {
-            uint64_t addr = ParseImmediate(target);
-            assembler.call(addr);
-            return true;
-        }
+        ctx.code.flatten();
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
 
-        // It's a label
-        if (labelMap.find(target) == labelMap.end()) {
-            labelMap[target] = assembler.newLabel();
-        }
-        assembler.call(labelMap[target]);
-        return true;
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
-    bool AssemblyEngine::HandleLea(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    ByteVector AssemblyEngine::GenerateJump(AddressType from, AddressType to) {
+        AssemblyContext ctx(runtime_.get(), from);
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
+        int64_t offset = static_cast<int64_t>(to) - static_cast<int64_t>(from) - 5;
 
-        x86::Gp dstReg = ParseRegister(dst);
-
-        if (dstReg.isValid() && src[0] == '[') {
-            assembler.lea(dstReg, ParseMemory(src));
-            return true;
+        if (offset >= INT32_MIN && offset <= INT32_MAX) {
+            // Near jump with 32-bit offset
+            ctx.assembler.jmp(imm(to));
+        }
+        else {
+            // Far jump using absolute address
+            Label target = ctx.assembler.newLabel();
+            ctx.assembler.jmp(ptr(target));
+            ctx.assembler.align(AlignMode::kData, 8);
+            ctx.assembler.bind(target);
+            ctx.assembler.embedUInt64(to);
         }
 
-        return false;
+        ctx.code.flatten();
+        ctx.code.resolveUnresolvedLinks();
+
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
-    bool AssemblyEngine::HandleTest(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+    ByteVector AssemblyEngine::GenerateCall(AddressType from, AddressType to) {
+        AssemblyContext ctx(runtime_.get(), from);
 
-        const std::string& op1 = operands[0];
-        const std::string& op2 = operands[1];
+        int64_t offset = static_cast<int64_t>(to) - static_cast<int64_t>(from) - 5;
 
-        x86::Gp reg1 = ParseRegister(op1);
-        x86::Gp reg2 = ParseRegister(op2);
-
-        if (reg1.isValid() && reg2.isValid()) {
-            assembler.test(reg1, reg2);
-            return true;
+        if (offset >= INT32_MIN && offset <= INT32_MAX) {
+            // Near call
+            ctx.assembler.call(imm(to));
+        }
+        else {
+            // Far call
+            ctx.assembler.mov(rax, imm(to));
+            ctx.assembler.call(rax);
         }
 
-        if (reg1.isValid() && !reg2.isValid()) {
-            uint64_t imm = ParseImmediate(op2);
-            assembler.test(reg1, imm);
-            return true;
-        }
+        ctx.code.flatten();
+        ctx.code.resolveUnresolvedLinks();
 
-        return false;
+        CodeBuffer& buffer = ctx.code.sectionById(0)->buffer();
+        return ByteVector(buffer.data(), buffer.data() + buffer.size());
     }
 
-    bool AssemblyEngine::HandlePush(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 1) return false;
+    ByteVector AssemblyEngine::GenerateDetour(AddressType from, AddressType to, size_t& trampolineSize) {
+        // Generate a jump and ensure minimum size
+        ByteVector jump = GenerateJump(from, to);
 
-        const std::string& op = operands[0];
-        x86::Gp reg = ParseRegister(op);
+        trampolineSize = max(jump.size(), size_t(5));
 
-        if (reg.isValid()) {
-            assembler.push(reg);
-            return true;
+        // Pad with NOPs if needed
+        while (jump.size() < trampolineSize) {
+            jump.push_back(0x90);
         }
 
-        // Immediate
-        uint64_t imm = ParseImmediate(op);
-        assembler.push(Imm(imm));
-        return true;
+        return jump;
     }
 
-    bool AssemblyEngine::HandlePop(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 1) return false;
+    std::optional<AssemblyEngine::HookInfo> AssemblyEngine::CreateHook(
+        AddressType targetAddress,
+        const std::string& hookCode) {
 
-        const std::string& op = operands[0];
-        x86::Gp reg = ParseRegister(op);
+        HookInfo hook;
+        hook.targetAddress = targetAddress;
 
-        if (reg.isValid()) {
-            assembler.pop(reg);
-            return true;
+        // Assemble hook code
+        auto assembled = Assemble(hookCode);
+        if (!assembled) {
+            return std::nullopt;
         }
 
-        return false;
-    }
+        hook.hookBytes = assembled->machineCode;
 
-    bool AssemblyEngine::HandleAdd(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
+        // Additional hook setup would go here
 
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
-
-        x86::Gp dstReg = ParseRegister(dst);
-        x86::Gp srcReg = ParseRegister(src);
-
-        if (dstReg.isValid() && srcReg.isValid()) {
-            assembler.add(dstReg, srcReg);
-            return true;
-        }
-
-        if (dstReg.isValid() && !srcReg.isValid()) {
-            uint64_t imm = ParseImmediate(src);
-            assembler.add(dstReg, imm);
-            return true;
-        }
-
-        return false;
-    }
-
-    bool AssemblyEngine::HandleSub(x86::Assembler& assembler, const std::vector<std::string>& operands) {
-        if (operands.size() != 2) return false;
-
-        const std::string& dst = operands[0];
-        const std::string& src = operands[1];
-
-        x86::Gp dstReg = ParseRegister(dst);
-        x86::Gp srcReg = ParseRegister(src);
-
-        if (dstReg.isValid() && srcReg.isValid()) {
-            assembler.sub(dstReg, srcReg);
-            return true;
-        }
-
-        if (dstReg.isValid() && !srcReg.isValid()) {
-            uint64_t imm = ParseImmediate(src);
-            assembler.sub(dstReg, imm);
-            return true;
-        }
-
-        return false;
+        return hook;
     }
 
 } // namespace AsmEngine

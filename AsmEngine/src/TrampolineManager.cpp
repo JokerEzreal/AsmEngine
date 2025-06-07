@@ -172,78 +172,179 @@ namespace AsmEngine {
 
         return std::nullopt;
     }
+    size_t TrampolineManager::CalculatePreserveSize(AddressType address,
+        const ByteVector& bytes) {
+        // Use a disassembler to determine instruction boundaries
+        // For now, use a simple heuristic
 
-    bool TrampolineManager::CreateHook(AddressType originalAddress,
-        AddressType hookCodeAddress,
+        size_t size = 0;
+        size_t targetSize = kMinTrampolineSize;
+
+        // This is a simplified version - in reality you'd use a proper disassembler
+        while (size < targetSize && size < bytes.size()) {
+            uint8_t opcode = bytes[size];
+
+            // Handle common instruction prefixes
+            if (opcode == 0x48 || opcode == 0x66 || opcode == 0x67 ||
+                (opcode >= 0x40 && opcode <= 0x4F)) {
+                size++;
+                if (size >= bytes.size()) break;
+                opcode = bytes[size];
+            }
+
+            // Estimate instruction size based on opcode
+            if (opcode == 0xE9 || opcode == 0xE8) {
+                // JMP/CALL rel32
+                size += 5;
+            }
+            else if (opcode == 0xFF) {
+                // Indirect JMP/CALL
+                size += 2; // ModR/M byte
+                uint8_t modRM = bytes[size - 1];
+                uint8_t mod = (modRM >> 6) & 0x03;
+                uint8_t rm = modRM & 0x07;
+
+                if (mod == 0 && rm == 5) {
+                    size += 4; // disp32
+                }
+                else if (mod == 1) {
+                    size += 1; // disp8
+                }
+                else if (mod == 2) {
+                    size += 4; // disp32
+                }
+
+                if (rm == 4 && mod != 3) {
+                    size += 1; // SIB byte
+                }
+            }
+            else if ((opcode & 0xF0) == 0x50 || (opcode & 0xF0) == 0x90) {
+                // PUSH/POP reg, NOP
+                size += 1;
+            }
+            else if (opcode == 0x8B || opcode == 0x89) {
+                // MOV reg, r/m or MOV r/m, reg
+                size += 2; // Assume ModR/M
+            }
+            else {
+                // Default: assume 3-byte instruction
+                size += 3;
+            }
+        }
+
+        return size;
+    }
+
+    bool TrampolineManager::CreateHook(AddressType targetAddress, AddressType hookAddress,
         const std::string& description) {
         std::lock_guard<std::mutex> lock(mutex_);
 
-        // 检查是否已经存在
-        if (hooks_.find(originalAddress) != hooks_.end()) {
-            std::cerr << "[TrampolineManager] Hook already exists at 0x"
-                << std::hex << originalAddress << std::dec << std::endl;
+        // Check if hook already exists
+        if (FindHook(targetAddress)) {
             return false;
         }
 
-        // 找到或创建跳转表
-        AddressType jumpTableBase = FindOrCreateJumpTable(originalAddress);
-        if (jumpTableBase == 0) {
-            std::cerr << "[TrampolineManager] Failed to create jump table for 0x"
-                << std::hex << originalAddress << std::dec << std::endl;
+        // Read original bytes
+        ByteVector originalBytes(kMinTrampolineSize * 2); // Read extra for safety
+        if (!memoryManager_->ReadMemory(targetAddress, originalBytes.data(), originalBytes.size())) {
             return false;
         }
 
-        // 在跳转表中分配条目
-        auto jumpEntry = AllocateJumpTableEntry(jumpTableBase, hookCodeAddress);
-        if (!jumpEntry) {
-            std::cerr << "[TrampolineManager] Failed to allocate jump table entry" << std::endl;
+        // Determine actual bytes to preserve using disassembly
+        size_t preserveSize = CalculatePreserveSize(targetAddress, originalBytes);
+        originalBytes.resize(preserveSize);
+
+        // Allocate trampoline near target
+        AddressType trampolineAddress = AllocateTrampoline(targetAddress);
+        if (!trampolineAddress) {
             return false;
         }
 
-        // 读取原始字节
-        ByteVector originalBytes(5);
-        if (!memoryManager_->ReadMemory(originalAddress,
-            originalBytes.data(),
-            originalBytes.size())) {
-            std::cerr << "[TrampolineManager] Failed to read original bytes" << std::endl;
+        // Build trampoline with refactored AssemblyEngine
+        ByteVector trampolineCode = BuildTrampoline(targetAddress, hookAddress,
+            originalBytes, trampolineAddress);
+
+        // Write trampoline
+        if (!memoryManager_->WriteMemory(trampolineAddress, trampolineCode.data(),
+            trampolineCode.size())) {
+            FreeTrampoline(trampolineAddress);
             return false;
         }
 
-        // 生成E9跳转到跳转表
-        ByteVector hookJump;
-        hookJump.push_back(0xE9); // jmp rel32
+        // Create jump to hook using AssemblyEngine
+        AssemblyEngine asmEngine(nullptr, nullptr); // Temporary instance
+        ByteVector jumpCode = asmEngine.GenerateJump(targetAddress, hookAddress);
 
-        int32_t relOffset = static_cast<int32_t>(*jumpEntry - originalAddress - 5);
-        hookJump.push_back(relOffset & 0xFF);
-        hookJump.push_back((relOffset >> 8) & 0xFF);
-        hookJump.push_back((relOffset >> 16) & 0xFF);
-        hookJump.push_back((relOffset >> 24) & 0xFF);
-
-        // 写入hook
-        if (!memoryManager_->WriteMemory(originalAddress,
-            hookJump.data(),
-            hookJump.size())) {
-            std::cerr << "[TrampolineManager] Failed to write hook jump" << std::endl;
+        // Ensure jump fits in preserved space
+        if (jumpCode.size() > preserveSize) {
+            FreeTrampoline(trampolineAddress);
             return false;
         }
 
-        // 保存hook信息
-        HookEntry hook;
-        hook.originalAddress = originalAddress;
-        hook.jumpTableEntry = *jumpEntry;
-        hook.hookCodeAddress = hookCodeAddress;
+        // Pad with NOPs if needed
+        while (jumpCode.size() < preserveSize) {
+            jumpCode.push_back(0x90);
+        }
+
+        // Change protection and write jump
+        MemoryProtection oldProtection;
+        if (!memoryManager_->ProtectMemory(targetAddress, preserveSize,
+            MemoryProtection::ExecuteReadWrite, &oldProtection)) {
+            FreeTrampoline(trampolineAddress);
+            return false;
+        }
+
+        bool success = memoryManager_->WriteMemory(targetAddress, jumpCode.data(), jumpCode.size());
+
+        // Restore protection
+        memoryManager_->ProtectMemory(targetAddress, preserveSize, oldProtection);
+
+        if (!success) {
+            FreeTrampoline(trampolineAddress);
+            return false;
+        }
+
+        // Store hook info
+        HookInfo hook;
+        hook.originalAddress = targetAddress;
+        hook.hookCodeAddress = hookAddress;
+        hook.trampolineAddress = trampolineAddress;
         hook.originalBytes = originalBytes;
-        hook.hookSize = 5;
+        hook.trampolineSize = trampolineCode.size();
+        hook.description = description;
 
-        hooks_[originalAddress] = hook;
-
-        std::cout << "[TrampolineManager] Hook created:" << std::endl;
-        std::cout << "  Original: 0x" << std::hex << originalAddress << std::endl;
-        std::cout << "  Jump Table Entry: 0x" << *jumpEntry << std::endl;
-        std::cout << "  Hook Code: 0x" << hookCodeAddress << std::endl;
-        std::cout << "  Description: " << description << std::dec << std::endl;
+        hooks_.push_back(hook);
 
         return true;
+    }
+
+    ByteVector TrampolineManager::BuildTrampoline(AddressType originalAddress,
+        AddressType hookAddress,
+        const ByteVector& originalBytes,
+        AddressType trampolineAddress) {
+        // Use AssemblyEngine to build the trampoline
+        AssemblyEngine asmEngine(nullptr, nullptr);
+
+        std::stringstream trampolineAsm;
+
+        // First, add the original instructions
+        // For now, we'll just copy the original bytes
+        // In a full implementation, you'd relocate these instructions
+
+        // Then add a jump back to the original function
+        AddressType returnAddress = originalAddress + originalBytes.size();
+
+        // Generate the jump back
+        ByteVector jumpBack = asmEngine.GenerateJump(
+            trampolineAddress + originalBytes.size(),
+            returnAddress
+        );
+
+        // Combine original bytes and jump
+        ByteVector trampoline = originalBytes;
+        trampoline.insert(trampoline.end(), jumpBack.begin(), jumpBack.end());
+
+        return trampoline;
     }
 
     bool TrampolineManager::RemoveHook(AddressType originalAddress) {

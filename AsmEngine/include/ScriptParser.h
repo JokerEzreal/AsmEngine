@@ -40,6 +40,10 @@ namespace AsmEngine {
         Include,
         Define
     };
+    struct AssemblyBlock {
+        std::string code;
+        std::set<std::string> localLabels;
+    };
 
     // Parsed command
     struct ParsedCommand {

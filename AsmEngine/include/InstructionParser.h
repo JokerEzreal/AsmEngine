@@ -2,81 +2,36 @@
 
 #include <string>
 #include <vector>
-#include <unordered_map>
 #include <asmjit/x86.h>
 
 namespace AsmEngine {
 
+    // Simplified instruction parser - most functionality moved to AssemblyEngine
     class InstructionParser {
     public:
-        struct ParsedInstruction {
-            std::string mnemonic;
-            std::vector<std::string> operands;
-        };
+        // Simple tokenization for preprocessing
+        static std::vector<std::string> TokenizeInstruction(const std::string& instruction);
 
-        // Parse instruction string
-        static ParsedInstruction Parse(const std::string& instruction);
+        // Extract mnemonic and operands
+        static std::pair<std::string, std::vector<std::string>> ParseBasic(const std::string& instruction);
 
-        // Register mapping
-        static asmjit::x86::Gp GetGpRegister(const std::string& name);
-        static asmjit::x86::Xmm GetXmmRegister(const std::string& name);
+        // Helper to check instruction type
+        static bool IsJumpInstruction(const std::string& mnemonic);
+        static bool IsMemoryInstruction(const std::string& mnemonic);
+        static bool IsFloatInstruction(const std::string& mnemonic);
 
-        // Parse operand types
-        static bool IsRegister(const std::string& operand);
-        static bool IsImmediate(const std::string& operand);
-        static bool IsMemory(const std::string& operand);
+        // Size estimation for instruction (rough estimate for pre-allocation)
+        static size_t EstimateInstructionSize(const std::string& mnemonic,
+            const std::vector<std::string>& operands);
 
-        // Parse immediate values
-        static uint64_t ParseImmediate(const std::string& operand);
+        // Check if string is a valid register name
+        static bool IsRegister(const std::string& str);
 
-        // Parse memory operands like [rax+rbx*2+0x10]
-        struct MemoryOperand {
-            asmjit::x86::Gp base;
-            asmjit::x86::Gp index;
-            uint32_t scale;
-            int32_t displacement;
-            bool hasBase;
-            bool hasIndex;
-        };
+        // Check if string is a memory operand
+        static bool IsMemoryOperand(const std::string& str);
 
-        static MemoryOperand ParseMemory(const std::string& operand);
-
-    private:
-        static std::unordered_map<std::string, asmjit::x86::Gp> gpRegMap_;
-        static std::unordered_map<std::string, asmjit::x86::Xmm> xmmRegMap_;
-    };
-
-    // Extended assembler with more instructions
-    class ExtendedAssembler {
-    public:
-        static bool AssembleInstruction(
-            asmjit::x86::Assembler& assembler,
-            const InstructionParser::ParsedInstruction& parsed);
-
-    private:
-        // Instruction handlers
-        static bool HandleMov(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleAdd(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleSub(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandlePush(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandlePop(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleJmp(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleCall(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleLea(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleTest(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleCmp(asmjit::x86::Assembler& assembler,
-            const std::vector<std::string>& operands);
-        static bool HandleJcc(asmjit::x86::Assembler& assembler,
-            const std::string& mnemonic, const std::vector<std::string>& operands);
+        // Check if string is an immediate value
+        static bool IsImmediate(const std::string& str);
     };
 
 } // namespace AsmEngine
