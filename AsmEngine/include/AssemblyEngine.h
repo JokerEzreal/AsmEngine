@@ -21,7 +21,7 @@ namespace AsmEngine {
         ByteVector machineCode;
         std::unordered_map<std::string, AddressType> labels;
         std::vector<AssemblyInstruction> instructions;
-        size_t codeSize;
+        size_t codeSize = 0;
     };
 
     class AssemblyEngine {

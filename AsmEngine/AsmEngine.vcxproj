@@ -28,6 +28,7 @@
     <ClInclude Include="include\MemoryManager.h" />
     <ClInclude Include="include\ScriptParser.h" />
     <ClInclude Include="include\SymbolManager.h" />
+    <ClInclude Include="include\TrampolineManager.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\AOBScanner.cpp" />
@@ -39,6 +40,7 @@
     <ClCompile Include="src\MemoryManager.cpp" />
     <ClCompile Include="src\ScriptParser.cpp" />
     <ClCompile Include="src\SymbolManager.cpp" />
+    <ClCompile Include="src\TrampolineManager.cpp" />
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <VCProjectVersion>17.0</VCProjectVersion>

@@ -7,6 +7,7 @@
 #include "AssemblyEngine.h"
 #include "ScriptParser.h"
 #include "CaptureStorage.h"
+#include "TrampolineManager.h"
 
 namespace AsmEngine {
 

@@ -39,6 +39,9 @@
     <ClInclude Include="include\InstructionParser.h">
       <Filter>AsmEngine\include</Filter>
     </ClInclude>
+    <ClInclude Include="include\TrampolineManager.h">
+      <Filter>AsmEngine\include</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\AsmEngine.cpp">
@@ -66,6 +69,9 @@
       <Filter>AsmEngine\src</Filter>
     </ClCompile>
     <ClCompile Include="src\InstructionParser.cpp">
+      <Filter>AsmEngine\src</Filter>
+    </ClCompile>
+    <ClCompile Include="src\TrampolineManager.cpp">
       <Filter>AsmEngine\src</Filter>
     </ClCompile>
   </ItemGroup>
