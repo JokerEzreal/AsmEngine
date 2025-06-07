@@ -5,7 +5,7 @@
 #include "CaptureStorage.h"
 #include <asmjit/asmjit.h>
 #include <memory>
-
+#include <map>
 namespace AsmEngine {
 
     // Assembly instruction info
@@ -26,31 +26,34 @@ namespace AsmEngine {
 
     class AssemblyEngine {
     private:
-        std::unique_ptr<asmjit::JitRuntime> runtime_;
-        SymbolManager* symbolManager_;
-        CaptureStorage* captureStorage_;
+        // AsmJit instruction assembly
+        bool AssembleInstructionAsmJit(asmjit::x86::Assembler& assembler,
+            const std::string& instruction,
+            std::map<std::string, asmjit::Label>& labelMap,
+            std::vector<std::pair<size_t, std::string>>& jumpFixups);
 
-        // Preprocess assembly to resolve symbols and captures
-        std::string PreprocessAssembly(const std::string& assembly,
-            AddressType baseAddress) const;
+        // Register parsing
+        asmjit::x86::Gp ParseRegister(const std::string& str);
+        asmjit::x86::Xmm ParseXmmRegister(const std::string& str);
 
-        // Replace capture references with actual values
-        std::string ReplaceCaptureReferences(const std::string& line) const;
+        // Memory and immediate parsing
+        asmjit::x86::Mem ParseMemory(const std::string& str);
+        uint64_t ParseImmediate(const std::string& str);
 
-        std::string ProcessMemoryToken(const std::string& token) const;
-        bool IsRegisterName(const std::string& token) const;
-        std::string FixMemoryExpression(const std::string& expr) const;
-
-        // Replace symbol references with addresses
-        std::string ReplaceSymbolReferences(const std::string& line) const;
-
-        // Extract labels from assembly
-        std::vector<std::pair<std::string, size_t>> ExtractLabels(
-            const std::string& assembly) const;
-
-        // Parse and assemble single instruction using AsmJit
-        std::optional<ByteVector> AssembleWithAsmJit(const std::string& instruction,
-            AddressType address = 0);
+        // Instruction handlers
+        bool HandleMov(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandleMovss(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandleLea(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandleAdd(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandleSub(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandleTest(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandleCmp(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandlePush(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandlePop(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands);
+        bool HandleJmp(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands,
+            std::map<std::string, asmjit::Label>& labelMap);
+        bool HandleCall(asmjit::x86::Assembler& assembler, const std::vector<std::string>& operands,
+            std::map<std::string, asmjit::Label>& labelMap);
 
     public:
         AssemblyEngine(SymbolManager* symbolManager, CaptureStorage* captureStorage);

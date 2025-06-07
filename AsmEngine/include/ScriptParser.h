@@ -153,7 +153,7 @@ namespace AsmEngine {
 
     private:
         ErrorCallback errorCallback_;
-
+        std::string FixMemoryOffsets(const std::string& line) const;
         void ReportError(const std::string& message, size_t lineNumber);
     };
 

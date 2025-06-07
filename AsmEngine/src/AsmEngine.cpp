@@ -1,556 +1,741 @@
-﻿#include "AsmEngine.h"
-#include <TlHelp32.h>
-#include <algorithm>
+﻿// Enhanced AssemblyEngine.cpp using AsmJit
+#include "AssemblyEngine.h"
+#include <regex>
+#include <sstream>
 #include <iostream>
+#include <iomanip>
+#include <map>
 
 namespace AsmEngine {
 
-    AsmEngine::AsmEngine() : AsmEngine(EngineConfig{}) {
+    using namespace asmjit;
+
+    AssemblyEngine::AssemblyEngine(SymbolManager* symbolManager,
+        CaptureStorage* captureStorage)
+        : symbolManager_(symbolManager), captureStorage_(captureStorage) {
+
+        // Initialize AsmJit runtime
+        runtime_ = std::make_unique<JitRuntime>();
     }
 
-    AsmEngine::AsmEngine(const EngineConfig& config)
-        : processHandle_(nullptr), processId_(0), config_(config), isAttached_(false) {
+    AssemblyEngine::~AssemblyEngine() = default;
 
-        if (config_.enableDebugPrivileges) {
-            EnableDebugPrivilege();
-        }
-    }
+    // Enhanced assembly method that handles labels and multiple instructions
+    std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly,
+        AddressType baseAddress) {
 
-    AsmEngine::~AsmEngine() {
-        if (isAttached_) {
-            Detach();
-        }
-    }
+        AssembledCode result;
 
-    void AsmEngine::InitializeComponents() {
-        if (!processHandle_) {
-            throw EngineException(ErrorCode::ProcessNotFound, "Not attached to process");
-        }
+        // Create code holder and assembler
+        CodeHolder code;
+        code.init(runtime_->environment(), baseAddress);
 
-        // Initialize components in order
-        memoryManager_ = std::make_unique<MemoryManager>(processHandle_, processId_);
-        symbolManager_ = std::make_unique<SymbolManager>();
-        captureStorage_ = std::make_unique<CaptureStorage>();
-        aobScanner_ = std::make_unique<AOBScanner>(processHandle_, captureStorage_.get());
-        assemblyEngine_ = std::make_unique<AssemblyEngine>(symbolManager_.get(),
-            captureStorage_.get());
-        scriptParser_ = std::make_unique<ScriptParser>(this);
-        trampolineManager_ = std::make_unique<TrampolineManager>(memoryManager_.get());
+        x86::Assembler assembler(&code);
 
-        // Load persisted symbols if enabled
-        if (config_.enableSymbolPersistence && !config_.symbolPersistenceFile.empty()) {
-            try {
-                symbolManager_->ImportFromFile(config_.symbolPersistenceFile);
+        // Label management
+        std::map<std::string, Label> labelMap;
+        std::map<std::string, std::vector<size_t>> unresolvedJumps;
+        std::vector<std::pair<size_t, std::string>> jumpFixups;
+
+        // Parse assembly line by line
+        std::istringstream stream(assembly);
+        std::string line;
+
+        while (std::getline(stream, line)) {
+            // Trim whitespace
+            line.erase(0, line.find_first_not_of(" \t"));
+            line.erase(line.find_last_not_of(" \t") + 1);
+
+            // Skip empty lines and comments
+            if (line.empty() || line[0] == ';') {
+                continue;
             }
-            catch (...) {
-                // Ignore errors loading symbols
+
+            // Check for labels
+            if (line.back() == ':') {
+                std::string labelName = line.substr(0, line.length() - 1);
+
+                // Create or get label
+                if (labelMap.find(labelName) == labelMap.end()) {
+                    labelMap[labelName] = assembler.newLabel();
+                }
+
+                // Bind label to current position
+                assembler.bind(labelMap[labelName]);
+
+                // Store label address
+                result.labels[labelName] = baseAddress + assembler.offset();
+
+                continue;
+            }
+
+            // Preprocess the line
+            std::string processed = PreprocessAssembly(line, baseAddress + assembler.offset());
+
+            // Assemble the instruction
+            if (!AssembleInstructionAsmJit(assembler, processed, labelMap, jumpFixups)) {
+                std::cout << "[ERROR] Failed to assemble: " << line << std::endl;
+                std::cout << "[DEBUG] Processed: " << processed << std::endl;
             }
         }
-    }
 
-    void AsmEngine::ShutdownComponents() {
-        // Save symbols if persistence enabled
-        if (config_.enableSymbolPersistence && !config_.symbolPersistenceFile.empty() &&
-            symbolManager_) {
-            try {
-                symbolManager_->ExportToFile(config_.symbolPersistenceFile);
-            }
-            catch (...) {
-                // Ignore errors saving symbols
-            }
-        }
-
-        // Cleanup allocations if enabled
-        if (config_.autoCleanupOnExit && memoryManager_) {
-            memoryManager_->CleanupAllocations();
-        }
-
-        // Destroy components in reverse order
-        scriptParser_.reset();
-        assemblyEngine_.reset();
-        aobScanner_.reset();
-        captureStorage_.reset();
-        symbolManager_.reset();
-        memoryManager_.reset();
-    }
-
-    bool AsmEngine::AttachToProcess(DWORD processId) {
-        if (isAttached_) {
-            Detach();
-        }
-
-        processHandle_ = OpenProcess(PROCESS_ALL_ACCESS, FALSE, processId);
-        if (!processHandle_) {
-            HandleError(ErrorCode::ProcessNotFound,
-                "Failed to open process: " + std::to_string(processId));
-            return false;
-        }
-
-        processId_ = processId;
-        processName_ = GetProcessName(processId);
-        isAttached_ = true;
-
-        try {
-            InitializeComponents();
-        }
-        catch (const std::exception& e) {
-            Detach();
-            throw;
-        }
-
-        return true;
-    }
-
-    bool AsmEngine::AttachToProcess(const std::string& processName) {
-        auto pid = FindProcessId(processName);
-        if (!pid) {
-            HandleError(ErrorCode::ProcessNotFound,
-                "Process not found: " + processName);
-            return false;
-        }
-
-        return AttachToProcess(*pid);
-    }
-
-    void AsmEngine::Detach() {
-        if (!isAttached_) {
-            return;
-        }
-
-        ShutdownComponents();
-
-        if (processHandle_) {
-            CloseHandle(processHandle_);
-            processHandle_ = nullptr;
-        }
-
-        processId_ = 0;
-        processName_.clear();
-        isAttached_ = false;
-    }
-
-    bool AsmEngine::ExecuteScript(const std::string& script) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return false;
-        }
-
-        try {
-            scriptParser_->Parse(script);
-            scriptParser_->Execute();
-            return true;
-        }
-        catch (const EngineException& e) {
-            HandleError(e.code(), e.what());
-            return false;
-        }
-    }
-
-    bool AsmEngine::ExecuteScriptFile(const std::string& filename) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return false;
-        }
-
-        try {
-            scriptParser_->ParseFile(filename);
-            scriptParser_->Execute();
-            return true;
-        }
-        catch (const EngineException& e) {
-            HandleError(e.code(), e.what());
-            return false;
-        }
-    }
-
-    std::optional<AddressType> AsmEngine::FindPattern(const std::string& moduleName,
-        const std::string& pattern) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
+        // Finalize the code
+        Error err = code.flatten();
+        if (err) {
+            std::cout << "[ERROR] Failed to flatten code: " << DebugUtils::errorAsString(err) << std::endl;
             return std::nullopt;
         }
 
-        auto result = aobScanner_->ScanModule(moduleName, pattern);
-        if (result) {
-            return result->address;
+        err = code.resolveUnresolvedLinks();
+        if (err) {
+            std::cout << "[ERROR] Failed to resolve links: " << DebugUtils::errorAsString(err) << std::endl;
+            return std::nullopt;
         }
 
-        return std::nullopt;
-    }
-
-    AddressType AsmEngine::AllocateMemory(const std::string& name, size_t size) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return 0;
+        // Get the assembled code
+        CodeBuffer& buffer = code.sectionById(0)->buffer();
+        if (buffer.size() == 0) {
+            return std::nullopt;
         }
 
-        if (size > config_.maxAllocationSize) {
-            HandleError(ErrorCode::InvalidParameter,
-                "Allocation size exceeds maximum: " + std::to_string(size));
-            return 0;
-        }
-
-        AddressType address = memoryManager_->AllocateMemory(size);
-        if (address) {
-            symbolManager_->RegisterAllocation(name, address, size);
-        }
-
-        return address;
-    }
-
-    bool AsmEngine::CreateDetour(const std::string& targetSymbol,
-        const std::string& detourCode) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return false;
-        }
-
-        // Resolve target address
-        auto targetAddress = symbolManager_->ResolveAddress(targetSymbol);
-        if (!targetAddress) {
-            HandleError(ErrorCode::SymbolNotFound,
-                "Target symbol not found: " + targetSymbol);
-            return false;
-        }
-
-        // Allocate memory for detour code
-        AddressType detourAddress = memoryManager_->AllocateMemory(4096);
-        if (!detourAddress) {
-            HandleError(ErrorCode::AllocationError, "Failed to allocate detour memory");
-            return false;
-        }
-
-        // Assemble detour code
-        auto assembled = assemblyEngine_->Assemble(detourCode, detourAddress);
-        if (!assembled) {
-            HandleError(ErrorCode::AssemblyError, "Failed to assemble detour code");
-            memoryManager_->FreeMemory(detourAddress);
-            return false;
-        }
-
-        // Write detour code
-        if (!memoryManager_->WriteMemory(detourAddress, assembled->machineCode.data(),
-            assembled->machineCode.size())) {
-            HandleError(ErrorCode::MemoryAccessError, "Failed to write detour code");
-            memoryManager_->FreeMemory(detourAddress);
-            return false;
-        }
-
-        // Use TrampolineManager to create the hook
-        if (!trampolineManager_->CreateHook(*targetAddress, detourAddress, targetSymbol)) {
-            HandleError(ErrorCode::AllocationError, "Failed to create hook via trampoline");
-            memoryManager_->FreeMemory(detourAddress);
-            return false;
-        }
-
-        std::cout << "[AsmEngine] Detour created successfully:" << std::endl;
-        std::cout << "  Target: " << targetSymbol << " (0x" << std::hex << *targetAddress << ")" << std::endl;
-        std::cout << "  Detour Code: 0x" << detourAddress << std::dec << std::endl;
-
-        return true;
-    }
-
-    bool AsmEngine::CreateHook(AddressType targetAddress,
-        const std::string& hookCode,
-        const std::string& description) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return false;
-        }
-
-        // Allocate memory for hook code
-        AddressType hookCodeAddress = memoryManager_->AllocateMemory(4096);
-        if (!hookCodeAddress) {
-            HandleError(ErrorCode::AllocationError, "Failed to allocate hook memory");
-            return false;
-        }
-
-        // Assemble hook code
-        auto assembled = assemblyEngine_->Assemble(hookCode, hookCodeAddress);
-        if (!assembled) {
-            HandleError(ErrorCode::AssemblyError, "Failed to assemble hook code");
-            memoryManager_->FreeMemory(hookCodeAddress);
-            return false;
-        }
-
-        // Write hook code
-        if (!memoryManager_->WriteMemory(hookCodeAddress, assembled->machineCode.data(),
-            assembled->machineCode.size())) {
-            HandleError(ErrorCode::MemoryAccessError, "Failed to write hook code");
-            memoryManager_->FreeMemory(hookCodeAddress);
-            return false;
-        }
-
-        // Use TrampolineManager to create the hook
-        if (!trampolineManager_->CreateHook(targetAddress, hookCodeAddress, description)) {
-            HandleError(ErrorCode::AllocationError, "Failed to create hook via trampoline");
-            memoryManager_->FreeMemory(hookCodeAddress);
-            return false;
-        }
-
-        return true;
-    }
-
-    bool AsmEngine::RemoveHook(AddressType targetAddress) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return false;
-        }
-
-        return trampolineManager_->RemoveHook(targetAddress);
-    }
-
-    std::vector<std::pair<AddressType, AddressType>> AsmEngine::GetActiveHooks() const {
-        std::vector<std::pair<AddressType, AddressType>> result;
-
-        if (trampolineManager_) {
-            auto hooks = trampolineManager_->GetAllHooks();
-            for (const auto& hook : hooks) {
-                result.push_back({ hook.originalAddress, hook.hookCodeAddress });
-            }
-        }
+        result.machineCode.assign(buffer.data(), buffer.data() + buffer.size());
+        result.codeSize = buffer.size();
 
         return result;
     }
 
-    bool AsmEngine::WriteAssembly(AddressType address, const std::string& assembly) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return false;
-        }
+    // Enhanced instruction assembler using AsmJit
+    bool AssemblyEngine::AssembleInstructionAsmJit(x86::Assembler& assembler,
+        const std::string& instruction,
+        std::map<std::string, Label>& labelMap,
+        std::vector<std::pair<size_t, std::string>>& jumpFixups) {
 
-        auto assembled = assemblyEngine_->Assemble(assembly, address);
-        if (!assembled) {
-            HandleError(ErrorCode::AssemblyError, "Failed to assemble code");
-            return false;
-        }
+        // Parse instruction
+        std::istringstream iss(instruction);
+        std::string mnemonic;
+        iss >> mnemonic;
 
-        return memoryManager_->WriteMemory(address, assembled->machineCode.data(),
-            assembled->machineCode.size());
-    }
+        // Convert to lowercase
+        std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(), ::tolower);
 
-    bool AsmEngine::WriteAssembly(const std::string& symbol, const std::string& assembly) {
-        auto address = symbolManager_->ResolveAddress(symbol);
-        if (!address) {
-            HandleError(ErrorCode::SymbolNotFound, "Symbol not found: " + symbol);
-            return false;
-        }
+        // Get operands
+        std::string operandsStr;
+        std::getline(iss, operandsStr);
 
-        return WriteAssembly(*address, assembly);
-    }
+        // Parse operands
+        std::vector<std::string> operands;
+        if (!operandsStr.empty()) {
+            operandsStr.erase(0, operandsStr.find_first_not_of(" \t"));
 
-    bool AsmEngine::ExecuteBatch(const std::vector<BatchOperation>& operations) {
-        if (!isAttached_) {
-            HandleError(ErrorCode::ProcessNotFound, "Not attached to process");
-            return false;
-        }
+            std::string current;
+            bool inBrackets = false;
 
-        // Execute each operation
-        for (const auto& op : operations) {
-            try {
-                switch (op.type) {
-                case BatchOperation::Write: {
-                    if (!WriteAssembly(op.param1, op.param2)) {
-                        return false;
+            for (char c : operandsStr) {
+                if (c == '[') inBrackets = true;
+                else if (c == ']') inBrackets = false;
+
+                if (c == ',' && !inBrackets) {
+                    if (!current.empty()) {
+                        // Trim
+                        current.erase(0, current.find_first_not_of(" \t"));
+                        current.erase(current.find_last_not_of(" \t") + 1);
+                        operands.push_back(current);
+                        current.clear();
                     }
-                    break;
                 }
-
-                case BatchOperation::Allocate: {
-                    if (!AllocateMemory(op.param1, op.size)) {
-                        return false;
-                    }
-                    break;
-                }
-
-                case BatchOperation::Hook: {
-                    if (!CreateDetour(op.param1, op.param2)) {
-                        return false;
-                    }
-                    break;
-                }
-
-                case BatchOperation::Scan: {
-                    if (!FindPattern(op.param1, op.param2)) {
-                        return false;
-                    }
-                    break;
-                }
+                else {
+                    current += c;
                 }
             }
-            catch (const EngineException& e) {
-                HandleError(e.code(), e.what());
-                return false;
+
+            if (!current.empty()) {
+                current.erase(0, current.find_first_not_of(" \t"));
+                current.erase(current.find_last_not_of(" \t") + 1);
+                operands.push_back(current);
             }
         }
 
+        // Handle different instructions
+        if (mnemonic == "push") {
+            return HandlePush(assembler, operands);
+        }
+        else if (mnemonic == "pop") {
+            return HandlePop(assembler, operands);
+        }
+        else if (mnemonic == "mov") {
+            return HandleMov(assembler, operands);
+        }
+        else if (mnemonic == "movss") {
+            return HandleMovss(assembler, operands);
+        }
+        else if (mnemonic == "lea") {
+            return HandleLea(assembler, operands);
+        }
+        else if (mnemonic == "add") {
+            return HandleAdd(assembler, operands);
+        }
+        else if (mnemonic == "sub") {
+            return HandleSub(assembler, operands);
+        }
+        else if (mnemonic == "test") {
+            return HandleTest(assembler, operands);
+        }
+        else if (mnemonic == "cmp") {
+            return HandleCmp(assembler, operands);
+        }
+        else if (mnemonic == "jmp") {
+            return HandleJmp(assembler, operands, labelMap);
+        }
+        else if (mnemonic == "call") {
+            return HandleCall(assembler, operands, labelMap);
+        }
+        else if (mnemonic == "je" || mnemonic == "jz") {
+            return HandleJcc(assembler, x86::kCondE, operands, labelMap);
+        }
+        else if (mnemonic == "jne" || mnemonic == "jnz") {
+            return HandleJcc(assembler, x86::kCondNE, operands, labelMap);
+        }
+        else if (mnemonic == "jg") {
+            return HandleJcc(assembler, x86::kCondG, operands, labelMap);
+        }
+        else if (mnemonic == "jge") {
+            return HandleJcc(assembler, x86::kCondGE, operands, labelMap);
+        }
+        else if (mnemonic == "jl") {
+            return HandleJcc(assembler, x86::kCondL, operands, labelMap);
+        }
+        else if (mnemonic == "jle") {
+            return HandleJcc(assembler, x86::kCondLE, operands, labelMap);
+        }
+        else if (mnemonic == "ja") {
+            return HandleJcc(assembler, x86::kCondA, operands, labelMap);
+        }
+        else if (mnemonic == "jae") {
+            return HandleJcc(assembler, x86::kCondAE, operands, labelMap);
+        }
+        else if (mnemonic == "jb") {
+            return HandleJcc(assembler, x86::kCondB, operands, labelMap);
+        }
+        else if (mnemonic == "jbe") {
+            return HandleJcc(assembler, x86::kCondBE, operands, labelMap);
+        }
+        else if (mnemonic == "nop") {
+            assembler.nop();
+            return true;
+        }
+        else if (mnemonic == "ret") {
+            assembler.ret();
+            return true;
+        }
+
+        return false;
+    }
+
+    // Parse register
+    x86::Gp AssemblyEngine::ParseRegister(const std::string& str) {
+        using namespace asmjit::x86;
+
+        // 64-bit registers
+        if (str == "rax") return rax;
+        if (str == "rbx") return rbx;
+        if (str == "rcx") return rcx;
+        if (str == "rdx") return rdx;
+        if (str == "rsi") return rsi;
+        if (str == "rdi") return rdi;
+        if (str == "rbp") return rbp;
+        if (str == "rsp") return rsp;
+        if (str == "r8") return r8;
+        if (str == "r9") return r9;
+        if (str == "r10") return r10;
+        if (str == "r11") return r11;
+        if (str == "r12") return r12;
+        if (str == "r13") return r13;
+        if (str == "r14") return r14;
+        if (str == "r15") return r15;
+
+        // 32-bit registers
+        if (str == "eax") return eax;
+        if (str == "ebx") return ebx;
+        if (str == "ecx") return ecx;
+        if (str == "edx") return edx;
+        if (str == "esi") return esi;
+        if (str == "edi") return edi;
+        if (str == "ebp") return ebp;
+        if (str == "esp") return esp;
+
+        // 16-bit registers
+        if (str == "ax") return ax;
+        if (str == "bx") return bx;
+        if (str == "cx") return cx;
+        if (str == "dx") return dx;
+
+        // 8-bit registers
+        if (str == "al") return al;
+        if (str == "bl") return bl;
+        if (str == "cl") return cl;
+        if (str == "dl") return dl;
+
+        return x86::Gp(); // Invalid
+    }
+
+    // Parse XMM register
+    x86::Xmm AssemblyEngine::ParseXmmRegister(const std::string& str) {
+        using namespace asmjit::x86;
+
+        if (str == "xmm0") return xmm0;
+        if (str == "xmm1") return xmm1;
+        if (str == "xmm2") return xmm2;
+        if (str == "xmm3") return xmm3;
+        if (str == "xmm4") return xmm4;
+        if (str == "xmm5") return xmm5;
+        if (str == "xmm6") return xmm6;
+        if (str == "xmm7") return xmm7;
+
+        return x86::Xmm(); // Invalid
+    }
+
+    // Parse memory operand
+    x86::Mem AssemblyEngine::ParseMemory(const std::string& str) {
+        // Remove brackets
+        std::string expr = str.substr(1, str.length() - 2);
+
+        x86::Gp base;
+        x86::Gp index;
+        uint32_t scale = 1;
+        int32_t disp = 0;
+        bool hasBase = false;
+        bool hasIndex = false;
+
+        // Simple parser for [base+index*scale+disp] format
+        std::regex memRegex(R"(([a-zA-Z0-9]+)?(?:\s*\+\s*([a-zA-Z0-9]+)(?:\s*\*\s*(\d+))?)?(?:\s*([+-])\s*0x([0-9A-Fa-f]+))?(?:\s*([+-])\s*(\d+))?)");
+        std::smatch match;
+
+        // For simple absolute addresses like [0x12345678]
+        if (expr.find_first_of("+-*") == std::string::npos && !ParseRegister(expr).isValid()) {
+            // Pure address
+            uint64_t addr = ParseImmediate(expr);
+            return x86::ptr(addr);
+        }
+
+        // Parse complex expressions
+        std::string token;
+        bool expectOp = false;
+        char lastOp = '+';
+
+        for (size_t i = 0; i < expr.length(); i++) {
+            char c = expr[i];
+
+            if (c == ' ' || c == '\t') continue;
+
+            if (c == '+' || c == '-' || c == '*') {
+                if (!token.empty()) {
+                    // Process token
+                    if (ParseRegister(token).isValid()) {
+                        if (!hasBase) {
+                            base = ParseRegister(token);
+                            hasBase = true;
+                        }
+                        else {
+                            index = ParseRegister(token);
+                            hasIndex = true;
+                        }
+                    }
+                    else {
+                        // It's a displacement
+                        int32_t val = ParseImmediate(token);
+                        if (lastOp == '-') val = -val;
+                        disp += val;
+                    }
+                    token.clear();
+                }
+                lastOp = c;
+                expectOp = false;
+            }
+            else {
+                token += c;
+            }
+        }
+
+        // Process last token
+        if (!token.empty()) {
+            if (ParseRegister(token).isValid()) {
+                if (!hasBase) {
+                    base = ParseRegister(token);
+                    hasBase = true;
+                }
+                else {
+                    index = ParseRegister(token);
+                    hasIndex = true;
+                }
+            }
+            else {
+                int32_t val = ParseImmediate(token);
+                if (lastOp == '-') val = -val;
+                disp += val;
+            }
+        }
+
+        // Create memory operand
+        if (hasBase && hasIndex) {
+            return x86::ptr(base, index, scale, disp);
+        }
+        else if (hasBase) {
+            return x86::ptr(base, disp);
+        }
+        else {
+            return x86::ptr(disp);
+        }
+    }
+
+    // Parse immediate value
+    uint64_t AssemblyEngine::ParseImmediate(const std::string& str) {
+        if (str.empty()) return 0;
+
+        // Handle hex
+        if (str.size() > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+            return std::stoull(str, nullptr, 16);
+        }
+
+        // Default to decimal
+        return std::stoull(str, nullptr, 10);
+    }
+
+    // Instruction handlers
+    bool AssemblyEngine::HandleMov(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        // reg, reg
+        x86::Gp dstReg = ParseRegister(dst);
+        x86::Gp srcReg = ParseRegister(src);
+
+        if (dstReg.isValid() && srcReg.isValid()) {
+            assembler.mov(dstReg, srcReg);
+            return true;
+        }
+
+        // reg, imm
+        if (dstReg.isValid() && !srcReg.isValid() && src[0] != '[') {
+            uint64_t imm = ParseImmediate(src);
+            assembler.mov(dstReg, imm);
+            return true;
+        }
+
+        // reg, mem
+        if (dstReg.isValid() && src[0] == '[') {
+            assembler.mov(dstReg, ParseMemory(src));
+            return true;
+        }
+
+        // mem, reg
+        if (dst[0] == '[' && srcReg.isValid()) {
+            assembler.mov(ParseMemory(dst), srcReg);
+            return true;
+        }
+
+        // mem, imm - special handling
+        if (dst[0] == '[' && !srcReg.isValid() && src[0] != '[') {
+            x86::Mem mem = ParseMemory(dst);
+            uint64_t imm = ParseImmediate(src);
+
+            // Determine size based on immediate value
+            if (imm <= 0xFFFFFFFF) {
+                mem.setSize(4); // dword
+                assembler.mov(mem, static_cast<uint32_t>(imm));
+            }
+            else {
+                // For 64-bit immediates, we need to use a temporary register
+                assembler.push(x86::rax);
+                assembler.mov(x86::rax, imm);
+                assembler.mov(mem, x86::rax);
+                assembler.pop(x86::rax);
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    bool AssemblyEngine::HandleMovss(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        x86::Xmm dstXmm = ParseXmmRegister(dst);
+        x86::Xmm srcXmm = ParseXmmRegister(src);
+
+        // xmm, xmm
+        if (dstXmm.isValid() && srcXmm.isValid()) {
+            assembler.movss(dstXmm, srcXmm);
+            return true;
+        }
+
+        // xmm, mem
+        if (dstXmm.isValid() && src[0] == '[') {
+            assembler.movss(dstXmm, ParseMemory(src));
+            return true;
+        }
+
+        // mem, xmm
+        if (dst[0] == '[' && srcXmm.isValid()) {
+            assembler.movss(ParseMemory(dst), srcXmm);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool AssemblyEngine::HandleCmp(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& op1 = operands[0];
+        const std::string& op2 = operands[1];
+
+        x86::Gp reg1 = ParseRegister(op1);
+        x86::Gp reg2 = ParseRegister(op2);
+
+        // reg, reg
+        if (reg1.isValid() && reg2.isValid()) {
+            assembler.cmp(reg1, reg2);
+            return true;
+        }
+
+        // reg, imm
+        if (reg1.isValid() && !reg2.isValid() && op2[0] != '[') {
+            uint64_t imm = ParseImmediate(op2);
+            assembler.cmp(reg1, imm);
+            return true;
+        }
+
+        // reg, mem
+        if (reg1.isValid() && op2[0] == '[') {
+            assembler.cmp(reg1, ParseMemory(op2));
+            return true;
+        }
+
+        // mem, reg
+        if (op1[0] == '[' && reg2.isValid()) {
+            assembler.cmp(ParseMemory(op1), reg2);
+            return true;
+        }
+
+        // mem, imm
+        if (op1[0] == '[' && !reg2.isValid() && op2[0] != '[') {
+            x86::Mem mem = ParseMemory(op1);
+            uint64_t imm = ParseImmediate(op2);
+
+            // Set appropriate size
+            if (imm <= 0xFF) {
+                mem.setSize(1);
+                assembler.cmp(mem, static_cast<uint8_t>(imm));
+            }
+            else if (imm <= 0xFFFF) {
+                mem.setSize(2);
+                assembler.cmp(mem, static_cast<uint16_t>(imm));
+            }
+            else {
+                mem.setSize(4);
+                assembler.cmp(mem, static_cast<uint32_t>(imm));
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    bool AssemblyEngine::HandleJmp(x86::Assembler& assembler,
+        const std::vector<std::string>& operands,
+        std::map<std::string, Label>& labelMap) {
+        if (operands.size() != 1) return false;
+
+        const std::string& target = operands[0];
+
+        // Check if it's a register
+        x86::Gp reg = ParseRegister(target);
+        if (reg.isValid()) {
+            assembler.jmp(reg);
+            return true;
+        }
+
+        // Check if it's an immediate address
+        if (target[0] == '0' && target[1] == 'x') {
+            uint64_t addr = ParseImmediate(target);
+            assembler.jmp(addr);
+            return true;
+        }
+
+        // It's a label
+        if (labelMap.find(target) == labelMap.end()) {
+            labelMap[target] = assembler.newLabel();
+        }
+        assembler.jmp(labelMap[target]);
         return true;
     }
 
-    void AsmEngine::SetConfig(const EngineConfig& config) {
-        config_ = config;
+    bool AssemblyEngine::HandleJcc(x86::Assembler& assembler,
+        asmjit::CondCode cond,
+        const std::vector<std::string>& operands,
+        std::map<std::string, Label>& labelMap) {
+        if (operands.size() != 1) return false;
+
+        const std::string& target = operands[0];
+
+        // It's a label
+        if (labelMap.find(target) == labelMap.end()) {
+            labelMap[target] = assembler.newLabel();
+        }
+
+        // Use generic conditional jump
+        assembler.j(cond, labelMap[target]);
+        return true;
     }
 
-    void AsmEngine::SaveState(const std::string& filename) {
-        if (symbolManager_) {
-            symbolManager_->ExportToFile(filename);
+    bool AssemblyEngine::HandleCall(x86::Assembler& assembler,
+        const std::vector<std::string>& operands,
+        std::map<std::string, Label>& labelMap) {
+        if (operands.size() != 1) return false;
+
+        const std::string& target = operands[0];
+
+        // Check if it's a register
+        x86::Gp reg = ParseRegister(target);
+        if (reg.isValid()) {
+            assembler.call(reg);
+            return true;
         }
+
+        // Check if it's an immediate address
+        if (target[0] == '0' && target[1] == 'x') {
+            uint64_t addr = ParseImmediate(target);
+            assembler.call(addr);
+            return true;
+        }
+
+        // It's a label
+        if (labelMap.find(target) == labelMap.end()) {
+            labelMap[target] = assembler.newLabel();
+        }
+        assembler.call(labelMap[target]);
+        return true;
     }
 
-    void AsmEngine::LoadState(const std::string& filename) {
-        if (symbolManager_) {
-            symbolManager_->ImportFromFile(filename);
+    bool AssemblyEngine::HandleLea(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        x86::Gp dstReg = ParseRegister(dst);
+
+        if (dstReg.isValid() && src[0] == '[') {
+            assembler.lea(dstReg, ParseMemory(src));
+            return true;
         }
+
+        return false;
     }
 
-    void AsmEngine::SetErrorHandler(ErrorHandler handler) {
-        errorHandler_ = handler;
+    bool AssemblyEngine::HandleTest(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& op1 = operands[0];
+        const std::string& op2 = operands[1];
+
+        x86::Gp reg1 = ParseRegister(op1);
+        x86::Gp reg2 = ParseRegister(op2);
+
+        if (reg1.isValid() && reg2.isValid()) {
+            assembler.test(reg1, reg2);
+            return true;
+        }
+
+        if (reg1.isValid() && !reg2.isValid()) {
+            uint64_t imm = ParseImmediate(op2);
+            assembler.test(reg1, imm);
+            return true;
+        }
+
+        return false;
     }
 
-    void AsmEngine::HandleError(ErrorCode code, const std::string& message) {
-        if (errorHandler_) {
-            errorHandler_(code, message);
+    bool AssemblyEngine::HandlePush(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 1) return false;
+
+        const std::string& op = operands[0];
+        x86::Gp reg = ParseRegister(op);
+
+        if (reg.isValid()) {
+            assembler.push(reg);
+            return true;
         }
+
+        // Immediate
+        uint64_t imm = ParseImmediate(op);
+        assembler.push(Imm(imm));
+        return true;
     }
 
-    std::optional<DWORD> AsmEngine::FindProcessId(const std::string& processName) {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) {
-            return std::nullopt;
+    bool AssemblyEngine::HandlePop(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 1) return false;
+
+        const std::string& op = operands[0];
+        x86::Gp reg = ParseRegister(op);
+
+        if (reg.isValid()) {
+            assembler.pop(reg);
+            return true;
         }
 
-        PROCESSENTRY32W pe32;
-        pe32.dwSize = sizeof(PROCESSENTRY32W);
-
-        if (Process32FirstW(snapshot, &pe32)) {
-            do {
-                // Convert wide string to string for comparison
-                std::wstring wExeFile(pe32.szExeFile);
-                std::string exeFile(wExeFile.begin(), wExeFile.end());
-
-                if (_stricmp(exeFile.c_str(), processName.c_str()) == 0) {
-                    CloseHandle(snapshot);
-                    return pe32.th32ProcessID;
-                }
-            } while (Process32NextW(snapshot, &pe32));
-        }
-
-        CloseHandle(snapshot);
-        return std::nullopt;
+        return false;
     }
 
-    std::string AsmEngine::GetProcessName(DWORD processId) {
-        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (snapshot == INVALID_HANDLE_VALUE) {
-            return "";
+    bool AssemblyEngine::HandleAdd(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        x86::Gp dstReg = ParseRegister(dst);
+        x86::Gp srcReg = ParseRegister(src);
+
+        if (dstReg.isValid() && srcReg.isValid()) {
+            assembler.add(dstReg, srcReg);
+            return true;
         }
 
-        PROCESSENTRY32W pe32;
-        pe32.dwSize = sizeof(PROCESSENTRY32W);
-
-        if (Process32FirstW(snapshot, &pe32)) {
-            do {
-                if (pe32.th32ProcessID == processId) {
-                    std::wstring wExeFile(pe32.szExeFile);
-                    std::string exeFile(wExeFile.begin(), wExeFile.end());
-                    CloseHandle(snapshot);
-                    return exeFile;
-                }
-            } while (Process32NextW(snapshot, &pe32));
+        if (dstReg.isValid() && !srcReg.isValid()) {
+            uint64_t imm = ParseImmediate(src);
+            assembler.add(dstReg, imm);
+            return true;
         }
 
-        CloseHandle(snapshot);
-        return "";
+        return false;
     }
 
-    // Quick namespace functions
-    namespace Quick {
+    bool AssemblyEngine::HandleSub(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
 
-        std::optional<AddressType> Scan(DWORD processId, const std::string& pattern) {
-            AsmEngine engine;
-            if (!engine.AttachToProcess(processId)) {
-                return std::nullopt;
-            }
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
 
-            auto results = engine.Scanner()->ScanAll(pattern);
-            if (!results.empty()) {
-                return results[0].address;
-            }
+        x86::Gp dstReg = ParseRegister(dst);
+        x86::Gp srcReg = ParseRegister(src);
 
-            return std::nullopt;
+        if (dstReg.isValid() && srcReg.isValid()) {
+            assembler.sub(dstReg, srcReg);
+            return true;
         }
 
-        bool Write(DWORD processId, AddressType address, const ByteVector& data) {
-            HANDLE process = OpenProcess(PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
-                FALSE, processId);
-            if (!process) {
-                return false;
-            }
-
-            SIZE_T written;
-            bool result = WriteProcessMemory(process,
-                reinterpret_cast<LPVOID>(address),
-                data.data(), data.size(), &written);
-
-            CloseHandle(process);
-            return result && written == data.size();
+        if (dstReg.isValid() && !srcReg.isValid()) {
+            uint64_t imm = ParseImmediate(src);
+            assembler.sub(dstReg, imm);
+            return true;
         }
 
-        std::optional<ByteVector> Read(DWORD processId, AddressType address, size_t size) {
-            HANDLE process = OpenProcess(PROCESS_VM_READ, FALSE, processId);
-            if (!process) {
-                return std::nullopt;
-            }
-
-            ByteVector data(size);
-            SIZE_T read;
-            bool result = ReadProcessMemory(process,
-                reinterpret_cast<LPCVOID>(address),
-                data.data(), size, &read);
-
-            CloseHandle(process);
-
-            if (result && read == size) {
-                return data;
-            }
-
-            return std::nullopt;
-        }
-
-        bool ExecuteCEScript(const std::string& processName, const std::string& script) {
-            try {
-                AsmEngine engine;
-
-                // Attach to process
-                if (!engine.AttachToProcess(processName)) {
-                    return false;
-                }
-
-                // Execute script
-                return engine.ExecuteScript(script);
-            }
-            catch (...) {
-                return false;
-            }
-        }
-
-        bool ExecuteCEScript(DWORD processId, const std::string& script) {
-            try {
-                AsmEngine engine;
-
-                // Attach to process
-                if (!engine.AttachToProcess(processId)) {
-                    return false;
-                }
-
-                // Execute script
-                return engine.ExecuteScript(script);
-            }
-            catch (...) {
-                return false;
-            }
-        }
-
-    } // namespace Quick
+        return false;
+    }
 
 } // namespace AsmEngine

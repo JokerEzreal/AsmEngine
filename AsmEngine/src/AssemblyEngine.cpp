@@ -1,10 +1,11 @@
-﻿#include "AssemblyEngine.h"
+﻿// Enhanced AssemblyEngine.cpp using AsmJit
+#include "AssemblyEngine.h"
 #include "InstructionParser.h"
 #include <regex>
 #include <sstream>
 #include <asmjit/x86.h>
 #include <iostream>
-#include <set>
+#include <iomanip>
 
 namespace AsmEngine {
 
@@ -18,463 +19,27 @@ namespace AsmEngine {
         runtime_ = std::make_unique<JitRuntime>();
     }
 
-    AssemblyEngine::~AssemblyEngine() {
-        // AsmJit cleanup is automatic
-    }
+    AssemblyEngine::~AssemblyEngine() = default;
 
-    std::string AssemblyEngine::FixMemoryExpression(const std::string& expr) const {
-        std::string fixed = expr;
-
-        // Pattern to match register+offset or register-offset
-        // This handles cases like rax+30, rdx-0C, etc.
-        std::regex offsetRegex(R"(([a-zA-Z]+[0-9]*)([+-])([0-9A-Fa-f]+)\b)");
-        std::smatch match;
-
-        std::string result;
-        std::string temp = fixed;
-
-        while (std::regex_search(temp, match, offsetRegex)) {
-            result += temp.substr(0, match.position());
-
-            std::string reg = match[1].str();
-            std::string sign = match[2].str();
-            std::string offset = match[3].str();
-
-            // Check if offset already has 0x prefix
-            if (offset.substr(0, 2) != "0x" && offset.substr(0, 2) != "0X") {
-                // Check if it looks like a hex number
-                bool hasHexDigit = false;
-                for (char c : offset) {
-                    if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
-                        hasHexDigit = true;
-                        break;
-                    }
-                }
-
-                // Add 0x prefix for hex numbers
-                if (hasHexDigit || offset.length() > 2) {
-                    offset = "0x" + offset;
-                }
-            }
-
-            result += reg + sign + offset;
-            temp = match.suffix();
-        }
-        result += temp;
-
-        return result;
-    }
-
-    std::string AssemblyEngine::PreprocessAssembly(const std::string& assembly,
-        AddressType baseAddress) const {
-
-        std::string processed = assembly;
-
-        // Step 1: Replace capture references (s1, s2, etc.)
-        processed = ReplaceCaptureReferences(processed);
-
-        // Step 2: Process memory expressions and resolve symbols
-        // This handles patterns like [player], [rax+s1], [rbx+symbol], etc.
-        std::regex memExprRegex(R"(\[([^\]]+)\])");
-        std::smatch match;
-        std::string result;
-
-        auto tempStr = processed;
-        while (std::regex_search(tempStr, match, memExprRegex)) {
-            // Add everything before the match
-            result += tempStr.substr(0, match.position());
-
-            std::string memExpr = match[1].str();
-            std::string processedExpr;
-
-            std::cout << "[DEBUG] Processing memory expression: [" << memExpr << "]" << std::endl;
-
-            // Parse the memory expression
-            std::string currentToken;
-
-            for (size_t i = 0; i < memExpr.length(); ++i) {
-                char c = memExpr[i];
-
-                if (c == '+' || c == '-' || c == '*') {
-                    // Handle accumulated token
-                    if (!currentToken.empty()) {
-                        std::string processed = ProcessMemoryToken(currentToken);
-                        std::cout << "[DEBUG]   Token '" << currentToken << "' -> '" << processed << "'" << std::endl;
-                        processedExpr += processed;
-                        currentToken.clear();
-                    }
-                    processedExpr += c;
-                }
-                else if (c == ' ' || c == '\t') {
-                    // Handle accumulated token
-                    if (!currentToken.empty()) {
-                        std::string processed = ProcessMemoryToken(currentToken);
-                        std::cout << "[DEBUG]   Token '" << currentToken << "' -> '" << processed << "'" << std::endl;
-                        processedExpr += processed;
-                        currentToken.clear();
-                    }
-                    if (!processedExpr.empty() && processedExpr.back() != ' ') {
-                        processedExpr += ' ';
-                    }
-                }
-                else {
-                    currentToken += c;
-                }
-            }
-
-            // Handle final token
-            if (!currentToken.empty()) {
-                std::string processed = ProcessMemoryToken(currentToken);
-                std::cout << "[DEBUG]   Token '" << currentToken << "' -> '" << processed << "'" << std::endl;
-                processedExpr += processed;
-            }
-
-            std::cout << "[DEBUG] Memory expression result: [" << processedExpr << "]" << std::endl;
-
-            result += "[" + processedExpr + "]";
-            tempStr = match.suffix();
-        }
-        result += tempStr;
-
-        // Step 3: Process immediate values and symbol references outside of memory expressions
-        processed = result;
-        result.clear();
-
-        // Split by whitespace and commas to process each token
-        std::istringstream iss(processed);
-        std::string token;
-        bool firstToken = true;
-
-        while (iss >> token) {
-            if (!firstToken) {
-                result += " ";
-            }
-            firstToken = false;
-
-            // Skip if token contains brackets (already processed)
-            if (token.find('[') != std::string::npos || token.find(']') != std::string::npos) {
-                result += token;
-            }
-            // Skip register names
-            else if (IsRegisterName(token)) {
-                result += token;
-            }
-            // Skip instruction mnemonics (first token on line typically)
-            else if (result.empty() || result.back() == '\n') {
-                result += token;
-            }
-            // Try to resolve as symbol
-            else if (symbolManager_) {
-                // Remove comma if it's at the end
-                std::string cleanToken = token;
-                bool hasComma = false;
-                if (!cleanToken.empty() && cleanToken.back() == ',') {
-                    cleanToken.pop_back();
-                    hasComma = true;
-                }
-
-                auto addr = symbolManager_->ResolveAddress(cleanToken);
-                if (addr) {
-                    std::stringstream ss;
-                    ss << "0x" << std::hex << *addr;
-                    result += ss.str();
-                    if (hasComma) result += ",";
-
-                    std::cout << "[DEBUG] Resolved symbol '" << cleanToken << "' to " << ss.str() << std::endl;
-                }
-                else {
-                    result += token;
-                }
-            }
-            else {
-                result += token;
-            }
-        }
-
-        std::cout << "[DEBUG] PreprocessAssembly result: '" << result << "'" << std::endl;
-
-        return result;
-    }
-
-    // Helper method to process tokens inside memory expressions
-    std::string AssemblyEngine::ProcessMemoryToken(const std::string& token) const {
-        // Check if it's a register
-        if (IsRegisterName(token)) {
-            return token;
-        }
-
-        // Check if it's already a number (hex or decimal)
-        if (token.size() > 2 && token[0] == '0' && (token[1] == 'x' || token[1] == 'X')) {
-            return token;  // Already hex
-        }
-
-        // Try to resolve as symbol FIRST before checking if it's a number
-        if (symbolManager_) {
-            auto addr = symbolManager_->ResolveAddress(token);
-            if (addr) {
-                std::stringstream ss;
-                ss << "0x" << std::hex << *addr;
-                std::cout << "[DEBUG]     Symbol '" << token << "' resolved to " << ss.str() << std::endl;
-                return ss.str();
-            }
-        }
-
-        // Check if it's a pure number
-        bool isNumber = true;
-        bool hasHexDigit = false;
-        for (char c : token) {
-            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
-                isNumber = false;
-                break;
-            }
-            if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
-                hasHexDigit = true;
-            }
-        }
-
-        if (isNumber && !token.empty()) {
-            // If it has hex digits or is longer than 2 chars, treat as hex
-            if (hasHexDigit || token.length() > 2) {
-                return "0x" + token;  // Add 0x prefix
-            }
-            else {
-                // For small numbers like "30", check context
-                // In x64, offsets are often hex even without letters
-                try {
-                    int val = std::stoi(token, nullptr, 10);
-                    if (val > 9) {
-                        // Likely hex
-                        return "0x" + token;
-                    }
-                }
-                catch (...) {
-                    // Not a valid decimal, treat as hex
-                    return "0x" + token;
-                }
-                return token;  // Keep as is
-            }
-        }
-
-        // Return as is if can't resolve
-        std::cout << "[WARNING]     Could not resolve token '" << token << "'" << std::endl;
-        return token;
-    }
-
-    // Helper method to check if a token is a register name
-    bool AssemblyEngine::IsRegisterName(const std::string& token) const {
-        static const std::set<std::string> registers = {
-            // 64-bit registers
-            "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-            "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
-            // 32-bit registers
-            "eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-            "r8d", "r9d", "r10d", "r11d", "r12d", "r13d", "r14d", "r15d",
-            // 16-bit registers
-            "ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
-            "r8w", "r9w", "r10w", "r11w", "r12w", "r13w", "r14w", "r15w",
-            // 8-bit registers
-            "al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
-            "r8b", "r9b", "r10b", "r11b", "r12b", "r13b", "r14b", "r15b",
-            "ah", "bh", "ch", "dh",
-            // Segment registers
-            "cs", "ds", "es", "fs", "gs", "ss",
-            // Special registers
-            "rip", "eip", "ip"
-        };
-
-        return registers.find(token) != registers.end();
-    }
-
-    // Also add these method declarations to AssemblyEngine.h under private:
-    // std::string ProcessMemoryToken(const std::string& token) const;
-    // bool IsRegisterName(const std::string& token) const;
-
-    std::string AssemblyEngine::ReplaceCaptureReferences(const std::string& line) const {
-        if (!captureStorage_) {
-            return line;
-        }
-
-        std::string result = line;
-        auto captureNames = captureStorage_->GetAllNames();
-
-        // Debug output
-        if (!captureNames.empty()) {
-            std::cout << "[DEBUG] ReplaceCaptureReferences: input = '" << line << "'" << std::endl;
-            std::cout << "[DEBUG] Available captures: ";
-            for (const auto& name : captureNames) {
-                std::cout << name << " ";
-            }
-            std::cout << std::endl;
-        }
-
-        // Sort by length (descending) to replace longer names first
-        std::sort(captureNames.begin(), captureNames.end(),
-            [](const std::string& a, const std::string& b) {
-                return a.length() > b.length();
-            });
-
-        // Replace each capture reference
-        for (const auto& captureName : captureNames) {
-            // Create regex that matches the capture name as a whole word
-            // This handles cases like s1, s2 in expressions like [rax+s1]
-            std::regex captureRegex(R"(\b)" + captureName + R"(\b)");
-
-            auto capture = captureStorage_->Get(captureName);
-            if (!capture) continue;
-
-            // Convert captured value to appropriate representation
-            std::string replacement;
-
-            switch (capture->size) {
-            case 1:
-            {
-                std::stringstream ss;
-                ss << "0x" << std::hex << static_cast<unsigned>(capture->AsUInt8());
-                replacement = ss.str();
-            }
-            break;
-            case 2:
-            {
-                std::stringstream ss;
-                ss << "0x" << std::hex << capture->AsUInt16();
-                replacement = ss.str();
-            }
-            break;
-            case 4:
-            {
-                std::stringstream ss;
-                ss << "0x" << std::hex << capture->AsUInt32();
-                replacement = ss.str();
-            }
-            break;
-            case 8:
-            {
-                std::stringstream ss;
-                ss << "0x" << std::hex << capture->AsUInt64();
-                replacement = ss.str();
-            }
-            break;
-            default:
-                // For other sizes, use hex representation
-                replacement = "0x" + BytesToString(capture->data);
-                break;
-            }
-
-            // Replace all occurrences
-            try {
-                std::string before = result;
-                result = std::regex_replace(result, captureRegex, replacement);
-                if (before != result) {
-                    std::cout << "[DEBUG] Replaced '" << captureName << "' with " << replacement << std::endl;
-                }
-            }
-            catch (const std::regex_error& e) {
-                std::cout << "[WARNING] Failed to replace capture '" << captureName
-                    << "': " << e.what() << std::endl;
-            }
-        }
-
-        if (!captureNames.empty() && result != line) {
-            std::cout << "[DEBUG] ReplaceCaptureReferences: output = '" << result << "'" << std::endl;
-        }
-
-        return result;
-    }
-
-    std::string AssemblyEngine::ReplaceSymbolReferences(const std::string& line) const {
-        if (!symbolManager_) {
-            return line;
-        }
-
-        std::string result = line;
-
-        // Get all symbols
-        auto symbols = symbolManager_->GetAllSymbols();
-
-        // Sort by name length (descending) to replace longer names first
-        std::sort(symbols.begin(), symbols.end(),
-            [](const Symbol& a, const Symbol& b) {
-                return a.name.length() > b.name.length();
-            });
-
-        // Replace each symbol reference with its address
-        for (const auto& symbol : symbols) {
-            // Skip if it's a label that might be used in jumps
-            if (symbol.type == SymbolType::Label) {
-                // Only replace in certain contexts (not in jump instructions)
-                if (line.find("jmp") != std::string::npos ||
-                    line.find("call") != std::string::npos ||
-                    line.find("je") != std::string::npos ||
-                    line.find("jne") != std::string::npos ||
-                    line.find("jg") != std::string::npos ||
-                    line.find("jl") != std::string::npos ||
-                    line.find("ja") != std::string::npos ||
-                    line.find("jb") != std::string::npos) {
-                    continue;
-                }
-            }
-
-            // Create a more specific regex that won't match inside brackets if the symbol isn't resolved
-            // This prevents regex errors when we have [unresolved_symbol]
-            std::regex symbolRegex(R"(\b)" + symbol.name + R"(\b(?![^\[]*\]))");
-            std::stringstream replacement;
-            replacement << "0x" << std::hex << symbol.address;
-
-            try {
-                result = std::regex_replace(result, symbolRegex, replacement.str());
-            }
-            catch (const std::regex_error& e) {
-                // If regex fails, skip this symbol
-                std::cout << "[WARNING] Failed to replace symbol '" << symbol.name
-                    << "': " << e.what() << std::endl;
-            }
-        }
-
-        return result;
-    }
-
-    std::optional<ByteVector> AssemblyEngine::AssembleWithAsmJit(
-        const std::string& instruction, AddressType address) {
-
-        CodeHolder code;
-        code.init(runtime_->environment());
-
-        x86::Assembler assembler(&code);
-
-        // Parse instruction using the new parser
-        auto parsed = InstructionParser::Parse(instruction);
-
-        try {
-            // Use the extended assembler for instruction handling
-            if (!ExtendedAssembler::AssembleInstruction(assembler, parsed)) {
-                return std::nullopt;
-            }
-
-        }
-        catch (...) {
-            return std::nullopt;
-        }
-
-        // Get the assembled code
-        CodeBuffer& buffer = code.sectionById(0)->buffer();
-        if (buffer.size() == 0) {
-            return std::nullopt;
-        }
-
-        ByteVector result(buffer.data(), buffer.data() + buffer.size());
-        return result;
-    }
-
+    // Enhanced assembly method that handles labels and multiple instructions
     std::optional<AssembledCode> AssemblyEngine::Assemble(const std::string& assembly,
-        AddressType address) {
-
-        // Preprocess the assembly
-        std::string processed = PreprocessAssembly(assembly, address);
+        AddressType baseAddress) {
 
         AssembledCode result;
 
-        // Split into lines and assemble each
-        std::istringstream stream(processed);
+        // Create code holder and assembler
+        CodeHolder code;
+        code.init(runtime_->environment(), baseAddress);
+
+        x86::Assembler assembler(&code);
+
+        // Label management
+        std::map<std::string, Label> labelMap;
+        std::map<std::string, std::vector<size_t>> unresolvedJumps;
+        std::vector<std::pair<size_t, std::string>> jumpFixups;
+
+        // Parse assembly line by line
+        std::istringstream stream(assembly);
         std::string line;
 
         while (std::getline(stream, line)) {
@@ -490,232 +55,748 @@ namespace AsmEngine {
             // Check for labels
             if (line.back() == ':') {
                 std::string labelName = line.substr(0, line.length() - 1);
-                result.labels[labelName] = address + result.machineCode.size();
 
-                if (symbolManager_) {
-                    symbolManager_->RegisterLabel(labelName, address + result.machineCode.size());
+                // Create or get label
+                if (labelMap.find(labelName) == labelMap.end()) {
+                    labelMap[labelName] = assembler.newLabel();
                 }
+
+                // Bind label to current position
+                assembler.bind(labelMap[labelName]);
+
+                // Store label address
+                result.labels[labelName] = baseAddress + assembler.offset();
+
                 continue;
             }
 
-            // Assemble instruction
-            auto instructionBytes = AssembleWithAsmJit(line, address + result.machineCode.size());
-            if (instructionBytes) {
-                result.machineCode.insert(result.machineCode.end(),
-                    instructionBytes->begin(), instructionBytes->end());
+            // Preprocess the line
+            std::string processed = PreprocessAssembly(line, baseAddress + assembler.offset());
+
+            // Assemble the instruction
+            if (!AssembleInstructionAsmJit(assembler, processed, labelMap, jumpFixups)) {
+                std::cout << "[ERROR] Failed to assemble: " << line << std::endl;
+                std::cout << "[DEBUG] Processed: " << processed << std::endl;
             }
         }
 
-        result.codeSize = result.machineCode.size();
+        // Finalize the code
+        Error err = code.flatten();
+        if (err) {
+            std::cout << "[ERROR] Failed to flatten code: " << DebugUtils::errorAsString(err) << std::endl;
+            return std::nullopt;
+        }
+
+        err = code.resolveUnresolvedLinks();
+        if (err) {
+            std::cout << "[ERROR] Failed to resolve links: " << DebugUtils::errorAsString(err) << std::endl;
+            return std::nullopt;
+        }
+
+        // Get the assembled code
+        CodeBuffer& buffer = code.sectionById(0)->buffer();
+        if (buffer.size() == 0) {
+            return std::nullopt;
+        }
+
+        result.machineCode.assign(buffer.data(), buffer.data() + buffer.size());
+        result.codeSize = buffer.size();
+
         return result;
     }
 
-    std::optional<ByteVector> AssemblyEngine::AssembleInstruction(
-        const std::string& instruction, AddressType address) {
+    // Enhanced instruction assembler using AsmJit
+    bool AssemblyEngine::AssembleInstructionAsmJit(x86::Assembler& assembler,
+        const std::string& instruction,
+        std::map<std::string, Label>& labelMap,
+        std::vector<std::pair<size_t, std::string>>& jumpFixups) {
 
-        std::string processed = PreprocessAssembly(instruction, address);
-        return AssembleWithAsmJit(processed, address);
-    }
+        // Parse instruction
+        std::istringstream iss(instruction);
+        std::string mnemonic;
+        iss >> mnemonic;
 
-    std::vector<AssemblyInstruction> AssemblyEngine::Disassemble(
-        const ByteVector& machineCode, AddressType address) {
+        // Convert to lowercase
+        std::transform(mnemonic.begin(), mnemonic.end(), mnemonic.begin(), ::tolower);
 
-        // Note: For disassembly, you'd need to add a disassembler library like Zydis
-        std::vector<AssemblyInstruction> instructions;
+        // Get operands
+        std::string operandsStr;
+        std::getline(iss, operandsStr);
 
-        // TODO: Implement with Zydis disassembler
+        // Parse operands
+        std::vector<std::string> operands;
+        if (!operandsStr.empty()) {
+            operandsStr.erase(0, operandsStr.find_first_not_of(" \t"));
 
-        return instructions;
-    }
+            std::string current;
+            bool inBrackets = false;
 
-    ByteVector AssemblyEngine::GenerateNop(size_t count) {
-        ByteVector nops;
-        nops.reserve(count);
+            for (char c : operandsStr) {
+                if (c == '[') inBrackets = true;
+                else if (c == ']') inBrackets = false;
 
-        for (size_t i = 0; i < count; ++i) {
-            nops.push_back(0x90); // NOP
+                if (c == ',' && !inBrackets) {
+                    if (!current.empty()) {
+                        // Trim
+                        current.erase(0, current.find_first_not_of(" \t"));
+                        current.erase(current.find_last_not_of(" \t") + 1);
+                        operands.push_back(current);
+                        current.clear();
+                    }
+                }
+                else {
+                    current += c;
+                }
+            }
+
+            if (!current.empty()) {
+                current.erase(0, current.find_first_not_of(" \t"));
+                current.erase(current.find_last_not_of(" \t") + 1);
+                operands.push_back(current);
+            }
         }
 
-        return nops;
+        // Handle different instructions
+        if (mnemonic == "push") {
+            return HandlePush(assembler, operands);
+        }
+        else if (mnemonic == "pop") {
+            return HandlePop(assembler, operands);
+        }
+        else if (mnemonic == "mov") {
+            return HandleMov(assembler, operands);
+        }
+        else if (mnemonic == "movss") {
+            return HandleMovss(assembler, operands);
+        }
+        else if (mnemonic == "lea") {
+            return HandleLea(assembler, operands);
+        }
+        else if (mnemonic == "add") {
+            return HandleAdd(assembler, operands);
+        }
+        else if (mnemonic == "sub") {
+            return HandleSub(assembler, operands);
+        }
+        else if (mnemonic == "test") {
+            return HandleTest(assembler, operands);
+        }
+        else if (mnemonic == "cmp") {
+            return HandleCmp(assembler, operands);
+        }
+        else if (mnemonic == "jmp") {
+            return HandleJmp(assembler, operands, labelMap);
+        }
+        else if (mnemonic == "call") {
+            return HandleCall(assembler, operands, labelMap);
+        }
+        else if (mnemonic == "je" || mnemonic == "jz") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.je(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jne" || mnemonic == "jnz") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jne(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jg") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jg(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jge") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jge(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jl") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jl(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jle") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jle(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "ja") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.ja(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jae" || mnemonic == "jnc") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jae(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jb" || mnemonic == "jc") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jb(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "jbe") {
+            if (operands.size() != 1) return false;
+            const std::string& target = operands[0];
+            if (labelMap.find(target) == labelMap.end()) {
+                labelMap[target] = assembler.newLabel();
+            }
+            assembler.jbe(labelMap[target]);
+            return true;
+        }
+        else if (mnemonic == "nop") {
+            assembler.nop();
+            return true;
+        }
+        else if (mnemonic == "ret") {
+            assembler.ret();
+            return true;
+        }
+
+        return false;
     }
 
-    ByteVector AssemblyEngine::GenerateJump(AddressType from, AddressType to) {
-        ByteVector jump;
+    // Parse register
+    x86::Gp AssemblyEngine::ParseRegister(const std::string& str) {
+        using namespace asmjit::x86;
 
-        // 计算相对偏移
-        int64_t offset = static_cast<int64_t>(to) - static_cast<int64_t>(from) - 5;
+        // 64-bit registers
+        if (str == "rax") return rax;
+        if (str == "rbx") return rbx;
+        if (str == "rcx") return rcx;
+        if (str == "rdx") return rdx;
+        if (str == "rsi") return rsi;
+        if (str == "rdi") return rdi;
+        if (str == "rbp") return rbp;
+        if (str == "rsp") return rsp;
+        if (str == "r8") return r8;
+        if (str == "r9") return r9;
+        if (str == "r10") return r10;
+        if (str == "r11") return r11;
+        if (str == "r12") return r12;
+        if (str == "r13") return r13;
+        if (str == "r14") return r14;
+        if (str == "r15") return r15;
 
-        std::cout << "[DEBUG] Generating jump from 0x" << std::hex << from
-            << " to 0x" << to << std::dec << std::endl;
-        std::cout << "[DEBUG] Jump offset: 0x" << std::hex << offset << std::dec
-            << " (" << offset << " decimal)" << std::endl;
+        // 32-bit registers
+        if (str == "eax") return eax;
+        if (str == "ebx") return ebx;
+        if (str == "ecx") return ecx;
+        if (str == "edx") return edx;
+        if (str == "esi") return esi;
+        if (str == "edi") return edi;
+        if (str == "ebp") return ebp;
+        if (str == "esp") return esp;
 
-        // 检查是否可以使用短跳转（32位偏移）
-        if (offset >= INT32_MIN && offset <= INT32_MAX) {
-            // E9 rel32
-            jump.push_back(0xE9);
+        // 16-bit registers
+        if (str == "ax") return ax;
+        if (str == "bx") return bx;
+        if (str == "cx") return cx;
+        if (str == "dx") return dx;
 
-            // 添加偏移（小端序）
-            int32_t offset32 = static_cast<int32_t>(offset);
-            jump.push_back(offset32 & 0xFF);
-            jump.push_back((offset32 >> 8) & 0xFF);
-            jump.push_back((offset32 >> 16) & 0xFF);
-            jump.push_back((offset32 >> 24) & 0xFF);
+        // 8-bit registers
+        if (str == "al") return al;
+        if (str == "bl") return bl;
+        if (str == "cl") return cl;
+        if (str == "dl") return dl;
 
-            std::cout << "[DEBUG] Generated E9 relative jump: ";
-            for (uint8_t b : jump) {
-                std::cout << std::hex << std::setw(2) << std::setfill('0') << (int)b << " ";
+        return x86::Gp(); // Invalid
+    }
+
+    // Parse XMM register
+    x86::Xmm AssemblyEngine::ParseXmmRegister(const std::string& str) {
+        using namespace asmjit::x86;
+
+        if (str == "xmm0") return xmm0;
+        if (str == "xmm1") return xmm1;
+        if (str == "xmm2") return xmm2;
+        if (str == "xmm3") return xmm3;
+        if (str == "xmm4") return xmm4;
+        if (str == "xmm5") return xmm5;
+        if (str == "xmm6") return xmm6;
+        if (str == "xmm7") return xmm7;
+
+        return x86::Xmm(); // Invalid
+    }
+
+    // Parse memory operand
+    x86::Mem AssemblyEngine::ParseMemory(const std::string& str) {
+        // Remove brackets
+        std::string expr = str.substr(1, str.length() - 2);
+
+        x86::Gp base;
+        x86::Gp index;
+        uint32_t scale = 1;
+        int32_t disp = 0;
+        bool hasBase = false;
+        bool hasIndex = false;
+
+        // Simple parser for [base+index*scale+disp] format
+        std::regex memRegex(R"(([a-zA-Z0-9]+)?(?:\s*\+\s*([a-zA-Z0-9]+)(?:\s*\*\s*(\d+))?)?(?:\s*([+-])\s*0x([0-9A-Fa-f]+))?(?:\s*([+-])\s*(\d+))?)");
+        std::smatch match;
+
+        // For simple absolute addresses like [0x12345678]
+        if (expr.find_first_of("+-*") == std::string::npos && !ParseRegister(expr).isValid()) {
+            // Pure address
+            uint64_t addr = ParseImmediate(expr);
+            return x86::ptr(addr);
+        }
+
+        // Parse complex expressions
+        std::string token;
+        bool expectOp = false;
+        char lastOp = '+';
+
+        for (size_t i = 0; i < expr.length(); i++) {
+            char c = expr[i];
+
+            if (c == ' ' || c == '\t') continue;
+
+            if (c == '+' || c == '-' || c == '*') {
+                if (!token.empty()) {
+                    // Process token
+                    if (ParseRegister(token).isValid()) {
+                        if (!hasBase) {
+                            base = ParseRegister(token);
+                            hasBase = true;
+                        }
+                        else {
+                            index = ParseRegister(token);
+                            hasIndex = true;
+                        }
+                    }
+                    else {
+                        // It's a displacement
+                        int32_t val = ParseImmediate(token);
+                        if (lastOp == '-') val = -val;
+                        disp += val;
+                    }
+                    token.clear();
+                }
+                lastOp = c;
+                expectOp = false;
             }
-            std::cout << std::dec << std::endl;
+            else {
+                token += c;
+            }
+        }
+
+        // Process last token
+        if (!token.empty()) {
+            if (ParseRegister(token).isValid()) {
+                if (!hasBase) {
+                    base = ParseRegister(token);
+                    hasBase = true;
+                }
+                else {
+                    index = ParseRegister(token);
+                    hasIndex = true;
+                }
+            }
+            else {
+                int32_t val = ParseImmediate(token);
+                if (lastOp == '-') val = -val;
+                disp += val;
+            }
+        }
+
+        // Create memory operand
+        if (hasBase && hasIndex) {
+            return x86::ptr(base, index, scale, disp);
+        }
+        else if (hasBase) {
+            return x86::ptr(base, disp);
         }
         else {
-            std::cout << "[WARNING] Offset 0x" << std::hex << offset
-                << " too large for relative jump, using absolute jump" << std::dec << std::endl;
+            return x86::ptr(disp);
+        }
+    }
 
-            // 对于超出范围的跳转，使用 14 字节的绝对跳转
-            // jmp [rip+0]
-            jump.push_back(0xFF);
-            jump.push_back(0x25);
-            jump.push_back(0x00);
-            jump.push_back(0x00);
-            jump.push_back(0x00);
-            jump.push_back(0x00);
+    // Parse immediate value
+    uint64_t AssemblyEngine::ParseImmediate(const std::string& str) {
+        if (str.empty()) return 0;
 
-            // 后面跟着8字节的绝对地址
-            for (int i = 0; i < 8; ++i) {
-                jump.push_back((to >> (i * 8)) & 0xFF);
+        // Handle hex
+        if (str.size() > 2 && str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+            return std::stoull(str, nullptr, 16);
+        }
+
+        // Default to decimal
+        return std::stoull(str, nullptr, 10);
+    }
+
+    // Instruction handlers
+    bool AssemblyEngine::HandleMov(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        // reg, reg
+        x86::Gp dstReg = ParseRegister(dst);
+        x86::Gp srcReg = ParseRegister(src);
+
+        if (dstReg.isValid() && srcReg.isValid()) {
+            assembler.mov(dstReg, srcReg);
+            return true;
+        }
+
+        // reg, imm
+        if (dstReg.isValid() && !srcReg.isValid() && src[0] != '[') {
+            uint64_t imm = ParseImmediate(src);
+            assembler.mov(dstReg, imm);
+            return true;
+        }
+
+        // reg, mem
+        if (dstReg.isValid() && src[0] == '[') {
+            assembler.mov(dstReg, ParseMemory(src));
+            return true;
+        }
+
+        // mem, reg
+        if (dst[0] == '[' && srcReg.isValid()) {
+            assembler.mov(ParseMemory(dst), srcReg);
+            return true;
+        }
+
+        // mem, imm - special handling
+        if (dst[0] == '[' && !srcReg.isValid() && src[0] != '[') {
+            x86::Mem mem = ParseMemory(dst);
+            uint64_t imm = ParseImmediate(src);
+
+            // Determine size based on immediate value
+            if (imm <= 0xFFFFFFFF) {
+                mem.setSize(4); // dword
+                assembler.mov(mem, static_cast<uint32_t>(imm));
             }
-
-            std::cout << "[DEBUG] Generated FF 25 absolute jump" << std::endl;
-        }
-
-        return jump;
-    }
-
-    ByteVector AssemblyEngine::GenerateCall(AddressType from, AddressType to) {
-        ByteVector call;
-
-        // Calculate relative offset
-        int64_t offset = static_cast<int64_t>(to) - static_cast<int64_t>(from) - 5;
-
-        // Check if we can use a short call (32-bit offset)
-        if (offset >= INT32_MIN && offset <= INT32_MAX) {
-            // CALL rel32
-            call.push_back(0xE8);
-
-            // Add offset (little endian)
-            int32_t offset32 = static_cast<int32_t>(offset);
-            call.push_back(offset32 & 0xFF);
-            call.push_back((offset32 >> 8) & 0xFF);
-            call.push_back((offset32 >> 16) & 0xFF);
-            call.push_back((offset32 >> 24) & 0xFF);
-        }
-        else {
-            // Need absolute call (14 bytes)
-            // MOV RAX, address
-            call.push_back(0x48);
-            call.push_back(0xB8);
-
-            // Add address (little endian)
-            for (int i = 0; i < 8; ++i) {
-                call.push_back((to >> (i * 8)) & 0xFF);
+            else {
+                // For 64-bit immediates, we need to use a temporary register
+                assembler.push(x86::rax);
+                assembler.mov(x86::rax, imm);
+                assembler.mov(mem, x86::rax);
+                assembler.pop(x86::rax);
             }
-
-            // CALL RAX
-            call.push_back(0xFF);
-            call.push_back(0xD0);
+            return true;
         }
 
-        return call;
+        return false;
     }
 
-    ByteVector AssemblyEngine::GenerateDetour(AddressType from, AddressType to,
-        AddressType& trampolineSize) {
+    bool AssemblyEngine::HandleMovss(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
 
-        ByteVector detour;
-        trampolineSize = 5;
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
 
-        // Generate jump to hook
-        detour = GenerateJump(from, to);
+        x86::Xmm dstXmm = ParseXmmRegister(dst);
+        x86::Xmm srcXmm = ParseXmmRegister(src);
 
-        // Pad with NOPs if needed
-        while (detour.size() < trampolineSize) {
-            detour.push_back(0x90);
+        // xmm, xmm
+        if (dstXmm.isValid() && srcXmm.isValid()) {
+            assembler.movss(dstXmm, srcXmm);
+            return true;
         }
 
-        return detour;
-    }
-
-    std::optional<AssemblyEngine::CodeCave> AssemblyEngine::FindCodeCave(
-        AddressType nearAddress, size_t minSize) const {
-
-        // This is a basic implementation that looks for a sequence of NOPs or CC (int3)
-        // In a real implementation, you'd want more sophisticated cave detection
-
-        if (!symbolManager_) {
-            return std::nullopt;
+        // xmm, mem
+        if (dstXmm.isValid() && src[0] == '[') {
+            assembler.movss(dstXmm, ParseMemory(src));
+            return true;
         }
 
-        // Search in a 2GB range around the target address
-        const size_t searchRange = 0x7FFFFFFF; // 2GB - 1
-        const size_t pageSize = 0x1000; // 4KB
-
-        // TODO: Implement actual code cave searching logic
-        // For now, return nullopt
-        return std::nullopt;
-    }
-
-    std::optional<AssemblyEngine::HookInfo> AssemblyEngine::CreateHook(
-        AddressType targetAddress, const std::string& hookCode) {
-
-        HookInfo hook;
-        hook.targetAddress = targetAddress;
-
-        // Assemble hook code
-        auto assembled = Assemble(hookCode, 0);
-        if (!assembled) {
-            return std::nullopt;
+        // mem, xmm
+        if (dst[0] == '[' && srcXmm.isValid()) {
+            assembler.movss(ParseMemory(dst), srcXmm);
+            return true;
         }
 
-        hook.hookBytes = assembled->machineCode;
-
-        // TODO: Implement full hook creation with trampoline
-
-        return hook;
+        return false;
     }
 
-    std::optional<std::vector<uint64_t>> AssemblyEngine::ExecuteAssembly(
-        const std::string& assembly, const std::vector<uint64_t>& parameters) {
+    bool AssemblyEngine::HandleCmp(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
 
-        // Not implemented for safety reasons
-        return std::nullopt;
-    }
+        const std::string& op1 = operands[0];
+        const std::string& op2 = operands[1];
 
-    std::vector<std::pair<std::string, size_t>> AssemblyEngine::ExtractLabels(
-        const std::string& assembly) const {
+        x86::Gp reg1 = ParseRegister(op1);
+        x86::Gp reg2 = ParseRegister(op2);
 
-        std::vector<std::pair<std::string, size_t>> labels;
-        std::istringstream stream(assembly);
-        std::string line;
-        size_t offset = 0;
+        // reg, reg
+        if (reg1.isValid() && reg2.isValid()) {
+            assembler.cmp(reg1, reg2);
+            return true;
+        }
 
-        while (std::getline(stream, line)) {
-            // Trim whitespace
-            line.erase(0, line.find_first_not_of(" \t"));
-            line.erase(line.find_last_not_of(" \t") + 1);
+        // reg, imm
+        if (reg1.isValid() && !reg2.isValid() && op2[0] != '[') {
+            uint64_t imm = ParseImmediate(op2);
+            assembler.cmp(reg1, imm);
+            return true;
+        }
 
-            // Check if line is a label (ends with :)
-            if (!line.empty() && line.back() == ':') {
-                std::string labelName = line.substr(0, line.length() - 1);
-                labels.emplace_back(labelName, offset);
+        // reg, mem
+        if (reg1.isValid() && op2[0] == '[') {
+            assembler.cmp(reg1, ParseMemory(op2));
+            return true;
+        }
+
+        // mem, reg
+        if (op1[0] == '[' && reg2.isValid()) {
+            assembler.cmp(ParseMemory(op1), reg2);
+            return true;
+        }
+
+        // mem, imm
+        if (op1[0] == '[' && !reg2.isValid() && op2[0] != '[') {
+            x86::Mem mem = ParseMemory(op1);
+            uint64_t imm = ParseImmediate(op2);
+
+            // Set appropriate size
+            if (imm <= 0xFF) {
+                mem.setSize(1);
+                assembler.cmp(mem, static_cast<uint8_t>(imm));
             }
-            else if (!line.empty() && line[0] != ';') {
-                // Estimate instruction size (rough approximation)
-                offset += 5; // Average x64 instruction size
+            else if (imm <= 0xFFFF) {
+                mem.setSize(2);
+                assembler.cmp(mem, static_cast<uint16_t>(imm));
             }
+            else {
+                mem.setSize(4);
+                assembler.cmp(mem, static_cast<uint32_t>(imm));
+            }
+            return true;
         }
 
-        return labels;
+        return false;
+    }
+
+    bool AssemblyEngine::HandleJmp(x86::Assembler& assembler,
+        const std::vector<std::string>& operands,
+        std::map<std::string, Label>& labelMap) {
+        if (operands.size() != 1) return false;
+
+        const std::string& target = operands[0];
+
+        // Check if it's a register
+        x86::Gp reg = ParseRegister(target);
+        if (reg.isValid()) {
+            assembler.jmp(reg);
+            return true;
+        }
+
+        // Check if it's an immediate address
+        if (target[0] == '0' && target[1] == 'x') {
+            uint64_t addr = ParseImmediate(target);
+            assembler.jmp(addr);
+            return true;
+        }
+
+        // It's a label
+        if (labelMap.find(target) == labelMap.end()) {
+            labelMap[target] = assembler.newLabel();
+        }
+        assembler.jmp(labelMap[target]);
+        return true;
+    }
+
+    bool AssemblyEngine::HandleJcc(x86::Assembler& assembler,
+        asmjit::CondCode cond,
+        const std::vector<std::string>& operands,
+        std::map<std::string, Label>& labelMap) {
+        if (operands.size() != 1) return false;
+
+        const std::string& target = operands[0];
+
+        // It's a label
+        if (labelMap.find(target) == labelMap.end()) {
+            labelMap[target] = assembler.newLabel();
+        }
+
+        // Use generic conditional jump
+        assembler.j(cond, labelMap[target]);
+        return true;
+    }
+
+    bool AssemblyEngine::HandleCall(x86::Assembler& assembler,
+        const std::vector<std::string>& operands,
+        std::map<std::string, Label>& labelMap) {
+        if (operands.size() != 1) return false;
+
+        const std::string& target = operands[0];
+
+        // Check if it's a register
+        x86::Gp reg = ParseRegister(target);
+        if (reg.isValid()) {
+            assembler.call(reg);
+            return true;
+        }
+
+        // Check if it's an immediate address
+        if (target[0] == '0' && target[1] == 'x') {
+            uint64_t addr = ParseImmediate(target);
+            assembler.call(addr);
+            return true;
+        }
+
+        // It's a label
+        if (labelMap.find(target) == labelMap.end()) {
+            labelMap[target] = assembler.newLabel();
+        }
+        assembler.call(labelMap[target]);
+        return true;
+    }
+
+    bool AssemblyEngine::HandleLea(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        x86::Gp dstReg = ParseRegister(dst);
+
+        if (dstReg.isValid() && src[0] == '[') {
+            assembler.lea(dstReg, ParseMemory(src));
+            return true;
+        }
+
+        return false;
+    }
+
+    bool AssemblyEngine::HandleTest(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& op1 = operands[0];
+        const std::string& op2 = operands[1];
+
+        x86::Gp reg1 = ParseRegister(op1);
+        x86::Gp reg2 = ParseRegister(op2);
+
+        if (reg1.isValid() && reg2.isValid()) {
+            assembler.test(reg1, reg2);
+            return true;
+        }
+
+        if (reg1.isValid() && !reg2.isValid()) {
+            uint64_t imm = ParseImmediate(op2);
+            assembler.test(reg1, imm);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool AssemblyEngine::HandlePush(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 1) return false;
+
+        const std::string& op = operands[0];
+        x86::Gp reg = ParseRegister(op);
+
+        if (reg.isValid()) {
+            assembler.push(reg);
+            return true;
+        }
+
+        // Immediate
+        uint64_t imm = ParseImmediate(op);
+        assembler.push(Imm(imm));
+        return true;
+    }
+
+    bool AssemblyEngine::HandlePop(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 1) return false;
+
+        const std::string& op = operands[0];
+        x86::Gp reg = ParseRegister(op);
+
+        if (reg.isValid()) {
+            assembler.pop(reg);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool AssemblyEngine::HandleAdd(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        x86::Gp dstReg = ParseRegister(dst);
+        x86::Gp srcReg = ParseRegister(src);
+
+        if (dstReg.isValid() && srcReg.isValid()) {
+            assembler.add(dstReg, srcReg);
+            return true;
+        }
+
+        if (dstReg.isValid() && !srcReg.isValid()) {
+            uint64_t imm = ParseImmediate(src);
+            assembler.add(dstReg, imm);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool AssemblyEngine::HandleSub(x86::Assembler& assembler, const std::vector<std::string>& operands) {
+        if (operands.size() != 2) return false;
+
+        const std::string& dst = operands[0];
+        const std::string& src = operands[1];
+
+        x86::Gp dstReg = ParseRegister(dst);
+        x86::Gp srcReg = ParseRegister(src);
+
+        if (dstReg.isValid() && srcReg.isValid()) {
+            assembler.sub(dstReg, srcReg);
+            return true;
+        }
+
+        if (dstReg.isValid() && !srcReg.isValid()) {
+            uint64_t imm = ParseImmediate(src);
+            assembler.sub(dstReg, imm);
+            return true;
+        }
+
+        return false;
     }
 
 } // namespace AsmEngine
