@@ -78,7 +78,6 @@ namespace AsmEngine {
         std::regex memExprRegex(R"(\[([^\]]+)\])");
         std::smatch match;
         std::string result;
-        size_t lastPos = 0;
 
         auto tempStr = processed;
         while (std::regex_search(tempStr, match, memExprRegex)) {
@@ -88,10 +87,10 @@ namespace AsmEngine {
             std::string memExpr = match[1].str();
             std::string processedExpr;
 
+            std::cout << "[DEBUG] Processing memory expression: [" << memExpr << "]" << std::endl;
+
             // Parse the memory expression
             std::string currentToken;
-            bool inNumber = false;
-            bool lastWasOperator = false;
 
             for (size_t i = 0; i < memExpr.length(); ++i) {
                 char c = memExpr[i];
@@ -99,16 +98,19 @@ namespace AsmEngine {
                 if (c == '+' || c == '-' || c == '*') {
                     // Handle accumulated token
                     if (!currentToken.empty()) {
-                        processedExpr += ProcessMemoryToken(currentToken);
+                        std::string processed = ProcessMemoryToken(currentToken);
+                        std::cout << "[DEBUG]   Token '" << currentToken << "' -> '" << processed << "'" << std::endl;
+                        processedExpr += processed;
                         currentToken.clear();
                     }
                     processedExpr += c;
-                    lastWasOperator = true;
                 }
                 else if (c == ' ' || c == '\t') {
                     // Handle accumulated token
                     if (!currentToken.empty()) {
-                        processedExpr += ProcessMemoryToken(currentToken);
+                        std::string processed = ProcessMemoryToken(currentToken);
+                        std::cout << "[DEBUG]   Token '" << currentToken << "' -> '" << processed << "'" << std::endl;
+                        processedExpr += processed;
                         currentToken.clear();
                     }
                     if (!processedExpr.empty() && processedExpr.back() != ' ') {
@@ -117,14 +119,17 @@ namespace AsmEngine {
                 }
                 else {
                     currentToken += c;
-                    lastWasOperator = false;
                 }
             }
 
             // Handle final token
             if (!currentToken.empty()) {
-                processedExpr += ProcessMemoryToken(currentToken);
+                std::string processed = ProcessMemoryToken(currentToken);
+                std::cout << "[DEBUG]   Token '" << currentToken << "' -> '" << processed << "'" << std::endl;
+                processedExpr += processed;
             }
+
+            std::cout << "[DEBUG] Memory expression result: [" << processedExpr << "]" << std::endl;
 
             result += "[" + processedExpr + "]";
             tempStr = match.suffix();
@@ -136,45 +141,46 @@ namespace AsmEngine {
         result.clear();
 
         // Split by whitespace and commas to process each token
-        std::regex tokenRegex(R"([\s,]+)");
-        std::sregex_token_iterator it(processed.begin(), processed.end(), tokenRegex, -1);
-        std::sregex_token_iterator end;
+        std::istringstream iss(processed);
+        std::string token;
+        bool firstToken = true;
 
-        bool first = true;
-        std::string lastDelimiter;
-
-        for (; it != end; ++it) {
-            std::string token = it->str();
-
-            if (!first && !lastDelimiter.empty()) {
-                result += lastDelimiter;
+        while (iss >> token) {
+            if (!firstToken) {
+                result += " ";
             }
-            first = false;
-
-            // Skip if token is empty
-            if (token.empty()) {
-                continue;
-            }
+            firstToken = false;
 
             // Skip if token contains brackets (already processed)
             if (token.find('[') != std::string::npos || token.find(']') != std::string::npos) {
-                result += token;
-            }
-            // Skip if it's an instruction mnemonic (first token on line)
-            else if (result.empty() || result.back() == '\n') {
                 result += token;
             }
             // Skip register names
             else if (IsRegisterName(token)) {
                 result += token;
             }
+            // Skip instruction mnemonics (first token on line typically)
+            else if (result.empty() || result.back() == '\n') {
+                result += token;
+            }
             // Try to resolve as symbol
             else if (symbolManager_) {
-                auto addr = symbolManager_->ResolveAddress(token);
+                // Remove comma if it's at the end
+                std::string cleanToken = token;
+                bool hasComma = false;
+                if (!cleanToken.empty() && cleanToken.back() == ',') {
+                    cleanToken.pop_back();
+                    hasComma = true;
+                }
+
+                auto addr = symbolManager_->ResolveAddress(cleanToken);
                 if (addr) {
                     std::stringstream ss;
                     ss << "0x" << std::hex << *addr;
                     result += ss.str();
+                    if (hasComma) result += ",";
+
+                    std::cout << "[DEBUG] Resolved symbol '" << cleanToken << "' to " << ss.str() << std::endl;
                 }
                 else {
                     result += token;
@@ -183,23 +189,9 @@ namespace AsmEngine {
             else {
                 result += token;
             }
-
-            // Capture delimiter for next iteration
-            if (std::distance(it, end) > 1) {
-                auto pos = processed.find(token);
-                if (pos != std::string::npos) {
-                    pos += token.length();
-                    if (pos < processed.length()) {
-                        lastDelimiter.clear();
-                        while (pos < processed.length() &&
-                            (processed[pos] == ' ' || processed[pos] == ',' ||
-                                processed[pos] == '\t')) {
-                            lastDelimiter += processed[pos++];
-                        }
-                    }
-                }
-            }
         }
+
+        std::cout << "[DEBUG] PreprocessAssembly result: '" << result << "'" << std::endl;
 
         return result;
     }
@@ -216,44 +208,55 @@ namespace AsmEngine {
             return token;  // Already hex
         }
 
-        // Check if it's a pure hex number without 0x prefix
-        bool isPureHex = true;
-        for (char c : token) {
-            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
-                isPureHex = false;
-                break;
-            }
-        }
-
-        if (isPureHex && !token.empty()) {
-            // Check if it looks like a hex number (has A-F)
-            bool hasHexDigit = false;
-            for (char c : token) {
-                if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
-                    hasHexDigit = true;
-                    break;
-                }
-            }
-
-            if (hasHexDigit || token.length() > 2) {
-                return "0x" + token;  // Add 0x prefix
-            }
-            else {
-                return token;  // Keep as is (might be small decimal)
-            }
-        }
-
-        // Try to resolve as symbol
+        // Try to resolve as symbol FIRST before checking if it's a number
         if (symbolManager_) {
             auto addr = symbolManager_->ResolveAddress(token);
             if (addr) {
                 std::stringstream ss;
                 ss << "0x" << std::hex << *addr;
+                std::cout << "[DEBUG]     Symbol '" << token << "' resolved to " << ss.str() << std::endl;
                 return ss.str();
             }
         }
 
+        // Check if it's a pure number
+        bool isNumber = true;
+        bool hasHexDigit = false;
+        for (char c : token) {
+            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                isNumber = false;
+                break;
+            }
+            if ((c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')) {
+                hasHexDigit = true;
+            }
+        }
+
+        if (isNumber && !token.empty()) {
+            // If it has hex digits or is longer than 2 chars, treat as hex
+            if (hasHexDigit || token.length() > 2) {
+                return "0x" + token;  // Add 0x prefix
+            }
+            else {
+                // For small numbers like "30", check context
+                // In x64, offsets are often hex even without letters
+                try {
+                    int val = std::stoi(token, nullptr, 10);
+                    if (val > 9) {
+                        // Likely hex
+                        return "0x" + token;
+                    }
+                }
+                catch (...) {
+                    // Not a valid decimal, treat as hex
+                    return "0x" + token;
+                }
+                return token;  // Keep as is
+            }
+        }
+
         // Return as is if can't resolve
+        std::cout << "[WARNING]     Could not resolve token '" << token << "'" << std::endl;
         return token;
     }
 
@@ -295,9 +298,13 @@ namespace AsmEngine {
         auto captureNames = captureStorage_->GetAllNames();
 
         // Debug output
-        if (!captureNames.empty() && (line.find("s1") != std::string::npos ||
-            line.find("s2") != std::string::npos)) {
+        if (!captureNames.empty()) {
             std::cout << "[DEBUG] ReplaceCaptureReferences: input = '" << line << "'" << std::endl;
+            std::cout << "[DEBUG] Available captures: ";
+            for (const auto& name : captureNames) {
+                std::cout << name << " ";
+            }
+            std::cout << std::endl;
         }
 
         // Sort by length (descending) to replace longer names first
@@ -355,7 +362,11 @@ namespace AsmEngine {
 
             // Replace all occurrences
             try {
+                std::string before = result;
                 result = std::regex_replace(result, captureRegex, replacement);
+                if (before != result) {
+                    std::cout << "[DEBUG] Replaced '" << captureName << "' with " << replacement << std::endl;
+                }
             }
             catch (const std::regex_error& e) {
                 std::cout << "[WARNING] Failed to replace capture '" << captureName
@@ -536,7 +547,8 @@ namespace AsmEngine {
 
         std::cout << "[DEBUG] Generating jump from 0x" << std::hex << from
             << " to 0x" << to << std::dec << std::endl;
-        std::cout << "[DEBUG] Jump offset: 0x" << std::hex << offset << std::dec << std::endl;
+        std::cout << "[DEBUG] Jump offset: 0x" << std::hex << offset << std::dec
+            << " (" << offset << " decimal)" << std::endl;
 
         // 检查是否可以使用短跳转（32位偏移）
         if (offset >= INT32_MIN && offset <= INT32_MAX) {
@@ -557,9 +569,24 @@ namespace AsmEngine {
             std::cout << std::dec << std::endl;
         }
         else {
-            std::cout << "[WARNING] Offset too large for relative jump, need trampoline" << std::endl;
-            // 这里应该使用跳板机制
-            return ByteVector(); // 返回空，让调用者处理
+            std::cout << "[WARNING] Offset 0x" << std::hex << offset
+                << " too large for relative jump, using absolute jump" << std::dec << std::endl;
+
+            // 对于超出范围的跳转，使用 14 字节的绝对跳转
+            // jmp [rip+0]
+            jump.push_back(0xFF);
+            jump.push_back(0x25);
+            jump.push_back(0x00);
+            jump.push_back(0x00);
+            jump.push_back(0x00);
+            jump.push_back(0x00);
+
+            // 后面跟着8字节的绝对地址
+            for (int i = 0; i < 8; ++i) {
+                jump.push_back((to >> (i * 8)) & 0xFF);
+            }
+
+            std::cout << "[DEBUG] Generated FF 25 absolute jump" << std::endl;
         }
 
         return jump;

@@ -30,8 +30,6 @@ namespace AsmEngine {
         SymbolManager* symbolManager_;
         CaptureStorage* captureStorage_;
 
-        std::string FixMemoryExpression(const std::string& expr) const;
-
         // Preprocess assembly to resolve symbols and captures
         std::string PreprocessAssembly(const std::string& assembly,
             AddressType baseAddress) const;
@@ -41,6 +39,7 @@ namespace AsmEngine {
 
         std::string ProcessMemoryToken(const std::string& token) const;
         bool IsRegisterName(const std::string& token) const;
+        std::string FixMemoryExpression(const std::string& expr) const;
 
         // Replace symbol references with addresses
         std::string ReplaceSymbolReferences(const std::string& line) const;

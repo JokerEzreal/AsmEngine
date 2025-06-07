@@ -50,8 +50,13 @@ namespace AsmEngine {
         std::string line;
         size_t lineNumber = 0;
 
+        std::cout << "[DEBUG] Starting script parse..." << std::endl;
+
         while (std::getline(stream, line)) {
             lineNumber++;
+
+            // Store original line for debugging
+            std::string originalLine = line;
 
             // Trim whitespace
             line.erase(0, line.find_first_not_of(" \t\r\n"));
@@ -63,12 +68,20 @@ namespace AsmEngine {
                 continue;
             }
 
+            // Debug output for non-empty lines
+            if (lineNumber <= 50) {  // Only show first 50 lines to avoid too much output
+                std::cout << "[DEBUG] Line " << lineNumber << ": '" << originalLine << "'" << std::endl;
+                std::cout << "[DEBUG]   Trimmed: '" << line << "'" << std::endl;
+            }
+
             // Check for section markers
             if (line == "[ENABLE]") {
+                std::cout << "[DEBUG]   -> Begin ENABLE section" << std::endl;
                 BeginSection("ENABLE");
                 continue;
             }
             else if (line == "[DISABLE]") {
+                std::cout << "[DEBUG]   -> Begin DISABLE section" << std::endl;
                 BeginSection("DISABLE");
                 continue;
             }
@@ -81,9 +94,15 @@ namespace AsmEngine {
                 if (IsLabel(line)) {
                     auto [labelName, offset] = ParseLabelWithOffset(line);
 
+                    std::cout << "[DEBUG]   -> Label definition: " << labelName;
+                    if (offset > 0) {
+                        std::cout << " + " << offset;
+                    }
+                    std::cout << std::endl;
+
                     ParsedCommand cmd;
                     cmd.type = CommandType::Label;
-                    cmd.name = "label";
+                    cmd.name = labelName;  // 重要：这里应该是标签名，而不是 "label"
                     cmd.arguments.push_back(labelName);
                     if (offset > 0) {
                         cmd.arguments.push_back(std::to_string(offset));
@@ -102,6 +121,12 @@ namespace AsmEngine {
                 // Parse and add command
                 ParsedCommand cmd = ParseLine(line, lineNumber);
 
+                if (lineNumber <= 50) {
+                    std::cout << "[DEBUG]   -> Command: " << cmd.name
+                        << " (type=" << static_cast<int>(cmd.type)
+                        << ", Asm=" << static_cast<int>(CommandType::Asm) << ")" << std::endl;
+                }
+
                 if (currentSection_) {
                     currentSection_->commands.push_back(cmd);
                 }
@@ -117,6 +142,13 @@ namespace AsmEngine {
         }
 
         EndSection();
+
+        // Debug: Show total commands parsed
+        std::cout << "[DEBUG] Parse complete. Total sections: " << sections_.size() << std::endl;
+        for (const auto& section : sections_) {
+            std::cout << "[DEBUG] Section '" << section.name << "' has "
+                << section.commands.size() << " commands" << std::endl;
+        }
     }
 
     void ScriptParser::ParseFile(const std::string& filename) {
@@ -326,7 +358,7 @@ namespace AsmEngine {
 
             if (startParen != std::string::npos && endParen != std::string::npos &&
                 endParen > startParen) {
-                tokens.push_back("label");
+                tokens.push_back("label");  // Command is "label"
                 std::string labelName = processedLine.substr(startParen + 1,
                     endParen - startParen - 1);
                 tokens.push_back(labelName);
@@ -344,47 +376,49 @@ namespace AsmEngine {
 
             // Parse arguments inside parentheses
             std::string args = match[2].str();
-            std::string current;
-            bool inQuotes = false;
-            int parenDepth = 0;
+            if (!args.empty()) {
+                std::string current;
+                bool inQuotes = false;
+                int parenDepth = 0;
 
-            for (char c : args) {
-                if (c == '"' && (current.empty() || current.back() != '\\')) {
-                    inQuotes = !inQuotes;
-                    current += c;
-                }
-                else if (!inQuotes) {
-                    if (c == '(') {
-                        parenDepth++;
+                for (char c : args) {
+                    if (c == '"' && (current.empty() || current.back() != '\\')) {
+                        inQuotes = !inQuotes;
                         current += c;
                     }
-                    else if (c == ')') {
-                        parenDepth--;
-                        current += c;
-                    }
-                    else if (c == ',' && parenDepth == 0) {
-                        // Trim whitespace from current token
-                        current.erase(0, current.find_first_not_of(" \t"));
-                        current.erase(current.find_last_not_of(" \t") + 1);
-                        if (!current.empty()) {
-                            tokens.push_back(current);
-                            current.clear();
+                    else if (!inQuotes) {
+                        if (c == '(') {
+                            parenDepth++;
+                            current += c;
+                        }
+                        else if (c == ')') {
+                            parenDepth--;
+                            current += c;
+                        }
+                        else if (c == ',' && parenDepth == 0) {
+                            // Trim whitespace from current token
+                            current.erase(0, current.find_first_not_of(" \t"));
+                            current.erase(current.find_last_not_of(" \t") + 1);
+                            if (!current.empty()) {
+                                tokens.push_back(current);
+                                current.clear();
+                            }
+                        }
+                        else {
+                            current += c;
                         }
                     }
                     else {
                         current += c;
                     }
                 }
-                else {
-                    current += c;
-                }
-            }
 
-            // Add last token
-            current.erase(0, current.find_first_not_of(" \t"));
-            current.erase(current.find_last_not_of(" \t") + 1);
-            if (!current.empty()) {
-                tokens.push_back(current);
+                // Add last token
+                current.erase(0, current.find_first_not_of(" \t"));
+                current.erase(current.find_last_not_of(" \t") + 1);
+                if (!current.empty()) {
+                    tokens.push_back(current);
+                }
             }
 
             return tokens;
@@ -566,7 +600,7 @@ namespace AsmEngine {
 
         currentSection_ = &(*sectionIt);
 
-        // ============ 第1遍：处理 AOB扫描、内存分配、label声明 ============
+        // ============ 第1遍：处理 AOB扫描、内存分配、label()声明 ============
         std::cout << "[DEBUG] Pass 1: Processing allocations, scans and label declarations..." << std::endl;
 
         // Track declared labels for forward reference resolution
@@ -596,7 +630,7 @@ namespace AsmEngine {
                     break;
 
                 case CommandType::Label:
-                    // Handle label() declarations
+                    // Only handle label() declarations here
                     if (cmd.name == "label" && !cmd.arguments.empty()) {
                         declaredLabels.insert(cmd.arguments[0]);
                         std::cout << "[DEBUG] Declared label: " << cmd.arguments[0] << std::endl;
@@ -625,6 +659,8 @@ namespace AsmEngine {
             if (cmd.type == CommandType::Label && cmd.name != "label") {
                 std::string baseLabelName = cmd.arguments[0];
                 size_t offset = 0;
+
+                std::cout << "[DEBUG] Found label definition in pre-resolve: " << baseLabelName << std::endl;
 
                 if (cmd.arguments.size() > 1) {
                     offset = std::stoull(cmd.arguments[1]);
@@ -665,6 +701,9 @@ namespace AsmEngine {
                             std::string sublabel = nextCmd.arguments[0];
                             preresolvedLabels[sublabel] = currentAddr;
 
+                            std::cout << "[DEBUG] Pre-resolving data label '" << sublabel
+                                << "' at offset from " << baseLabelName << std::endl;
+
                             // Look at the next command to determine size
                             if (j + 1 < sectionIt->commands.size()) {
                                 const auto& dataCmd = sectionIt->commands[j + 1];
@@ -698,13 +737,95 @@ namespace AsmEngine {
                 << "' at 0x" << std::hex << addr << std::dec << std::endl;
         }
 
+        // ============ 计算代码标签位置 ============
+        std::cout << "[DEBUG] Calculating code label positions..." << std::endl;
+
+        // Map to track anonymous labels and code labels
+        std::map<std::string, std::vector<AddressType>> anonLabels; // Track @@ labels per section
+        std::map<std::string, AddressType> codeLabelAddresses;
+        AddressType estimatedAddress = 0;
+        std::string currentCodeSection;
+        int globalAnonCounter = 0;
+
+        for (size_t i = 0; i < sectionIt->commands.size(); i++) {
+            const auto& cmd = sectionIt->commands[i];
+
+            // Track current position for labels
+            if (cmd.type == CommandType::Label && cmd.name != "label") {
+                std::string labelName = cmd.arguments[0];
+
+                // Handle base labels with offsets
+                if (cmd.arguments.size() > 1) {
+                    size_t offset = std::stoull(cmd.arguments[1]);
+                    auto baseAddr = engine_->Symbols()->ResolveAddress(labelName);
+                    if (baseAddr || currentSection_->allocations.count(labelName)) {
+                        AddressType addr = baseAddr ? *baseAddr : currentSection_->allocations[labelName];
+                        estimatedAddress = addr + offset;
+                        currentCodeSection = labelName;
+                        if (offset > 0) {
+                            currentCodeSection += "_offset_" + std::to_string(offset);
+                        }
+                    }
+                }
+                // Handle anonymous labels
+                else if (labelName == "@@") {
+                    if (!currentCodeSection.empty() && estimatedAddress != 0) {
+                        anonLabels[currentCodeSection].push_back(estimatedAddress);
+                        globalAnonCounter++;
+                        std::string anonName = "__anon_label_" + std::to_string(globalAnonCounter);
+                        engine_->Symbols()->RegisterSymbol(anonName, estimatedAddress);
+                        std::cout << "[DEBUG] Registered anonymous label '" << anonName
+                            << "' at 0x" << std::hex << estimatedAddress << std::dec
+                            << " in section " << currentCodeSection << std::endl;
+                    }
+                }
+                // Handle named labels within code sections
+                else if (!currentCodeSection.empty() && estimatedAddress != 0) {
+                    // This is a code label like "code:" or "return:"
+                    codeLabelAddresses[labelName] = estimatedAddress;
+                    engine_->Symbols()->RegisterSymbol(labelName, estimatedAddress);
+                    currentSection_->labels[labelName] = estimatedAddress;
+                    std::cout << "[DEBUG] Registered code label '" << labelName
+                        << "' at 0x" << std::hex << estimatedAddress << std::dec << std::endl;
+                }
+            }
+            // Estimate size for assembly instructions
+            else if (cmd.type == CommandType::Asm && !currentCodeSection.empty() && estimatedAddress != 0) {
+                // Estimate instruction sizes
+                if (cmd.name == "nop_multiple" && !cmd.arguments.empty()) {
+                    estimatedAddress += std::stoi(cmd.arguments[0]);
+                }
+                else if (cmd.name == "push" || cmd.name == "pop") {
+                    estimatedAddress += 1;  // push/pop reg is 1 byte
+                }
+                else if (cmd.name == "mov" || cmd.name == "lea" || cmd.name == "cmp") {
+                    estimatedAddress += 7;  // Rough estimate
+                }
+                else if (cmd.name == "test") {
+                    estimatedAddress += 3;  // test reg,reg is 3 bytes
+                }
+                else if (cmd.name == "jmp" || cmd.name == "je" || cmd.name == "jne") {
+                    estimatedAddress += 5;  // Near jump
+                }
+                else if (cmd.name == "movss") {
+                    estimatedAddress += 4;  // SSE instruction
+                }
+                else {
+                    estimatedAddress += 5;  // Default estimate
+                }
+            }
+        }
+
         // ============ 第2遍：处理标签和代码生成 ============
         std::cout << "[DEBUG] Pass 2: Processing labels and assembly..." << std::endl;
+        std::cout << "[DEBUG] Total commands to process: " << sectionIt->commands.size() << std::endl;
 
         std::string currentLabel;
         AddressType currentWriteAddress = 0;
         AddressType currentBaseAddress = 0;
         bool hasValidLabel = false;
+        int localAnonCounter = 0;
+        std::string currentLabelSection;
 
         for (size_t cmdIndex = 0; cmdIndex < sectionIt->commands.size(); cmdIndex++) {
             const auto& cmd = sectionIt->commands[cmdIndex];
@@ -733,6 +854,12 @@ namespace AsmEngine {
                     }
                     std::cout << std::dec << std::endl;
 
+                    // Handle anonymous labels
+                    if (baseLabelName == "@@") {
+                        // Anonymous labels are already registered, skip
+                        continue;
+                    }
+
                     // Try to resolve base address
                     AddressType baseAddr = 0;
                     bool resolved = false;
@@ -753,9 +880,12 @@ namespace AsmEngine {
                         currentWriteAddress = baseAddr + offset;
                         currentBaseAddress = baseAddr;
                         currentLabel = baseLabelName;
+                        currentLabelSection = baseLabelName;
+                        localAnonCounter = 0;
 
                         if (offset > 0) {
                             currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
+                            currentLabelSection = currentLabel;
                         }
 
                         currentSection_->labels[currentLabel] = currentWriteAddress;
@@ -766,33 +896,19 @@ namespace AsmEngine {
                             << " at 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
                     }
                     else {
-                        // Internal label - check if it was pre-resolved
-                        if (preresolvedLabels.count(baseLabelName)) {
-                            currentWriteAddress = preresolvedLabels[baseLabelName];
+                        // Check if it's a code label that was pre-registered
+                        if (currentSection_->labels.count(baseLabelName)) {
+                            currentWriteAddress = currentSection_->labels[baseLabelName];
                             currentLabel = baseLabelName;
                             hasValidLabel = true;
-                            std::cout << "[DEBUG] Using pre-resolved address for '" << baseLabelName
-                                << "': 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
+                            std::cout << "[DEBUG] Using pre-registered label '" << baseLabelName
+                                << "' at 0x" << std::hex << currentWriteAddress << std::dec << std::endl;
                         }
                         else {
-                            // Check if it's a symbol that was just registered
-                            auto symAddr = engine_->Symbols()->ResolveAddress(baseLabelName);
-                            if (symAddr) {
-                                currentWriteAddress = *symAddr + offset;
-                                currentLabel = baseLabelName;
-                                if (offset > 0) {
-                                    currentLabel = baseLabelName + "_offset_" + std::to_string(offset);
-                                }
-                                hasValidLabel = true;
-                                std::cout << "[DEBUG] Found registered symbol '" << baseLabelName
-                                    << "' at 0x" << std::hex << *symAddr << std::dec << std::endl;
-                            }
-                            else {
-                                currentLabel = baseLabelName;
-                                hasValidLabel = false;
-                                std::cout << "[WARNING] Label '" << baseLabelName
-                                    << "' has no context" << std::endl;
-                            }
+                            currentLabel = baseLabelName;
+                            hasValidLabel = false;
+                            std::cout << "[WARNING] Label '" << baseLabelName
+                                << "' has no context" << std::endl;
                         }
                     }
                 }
@@ -816,10 +932,39 @@ namespace AsmEngine {
                 }
                 // Process assembly instructions
                 else if (cmd.type == CommandType::Asm && hasValidLabel && currentWriteAddress > 0) {
-                    // This is an assembly instruction
+                    // Build assembly instruction
                     std::string asmLine = cmd.name;
                     for (const auto& arg : cmd.arguments) {
                         asmLine += " " + arg;
+                    }
+
+                    // Handle anonymous label references
+                    if (asmLine.find("__anon_forward") != std::string::npos ||
+                        asmLine.find("__anon_backward") != std::string::npos ||
+                        asmLine.find("@f") != std::string::npos ||
+                        asmLine.find("@b") != std::string::npos) {
+
+                        // Replace with actual anonymous label
+                        if (asmLine.find("__anon_forward") != std::string::npos ||
+                            asmLine.find("@f") != std::string::npos) {
+                            // Find next anonymous label
+                            if (anonLabels.count(currentLabelSection)) {
+                                const auto& sectionAnons = anonLabels[currentLabelSection];
+                                for (AddressType anonAddr : sectionAnons) {
+                                    if (anonAddr > currentWriteAddress) {
+
+                                        auto symbols = engine_->Symbols()->GetAllSymbols();
+                                        for (const auto& symbol : symbols) {
+                                            if (symbol.address == anonAddr && symbol.name.find("__anon_label_") == 0) {
+                                                asmLine = cmd.name + " " + symbol.name;
+                                                break;
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     std::cout << "[DEBUG] Assembling for " << currentLabel
@@ -1312,6 +1457,51 @@ namespace AsmEngine {
             }
 
             if (baseAddr) {
+                // Special handling for hook locations
+                if (label.find("aobplayer") != std::string::npos && label.find("_offset_") != std::string::npos) {
+                    // This is a hook at aobplayer+D
+                    // Check if the code is trying to jump to newmem
+                    if (code.size() >= 12 && code[0] == 0x48 && code[1] == 0xB8) {
+                        // This looks like: mov rax, imm64; jmp rax
+                        // Try to extract the target address
+                        uint64_t targetAddr = 0;
+                        for (int i = 0; i < 8; ++i) {
+                            targetAddr |= static_cast<uint64_t>(code[2 + i]) << (i * 8);
+                        }
+
+                        std::cout << "[DEBUG] Detected absolute jump to 0x" << std::hex << targetAddr
+                            << " at hook location" << std::dec << std::endl;
+
+                        // Generate proper E9 relative jump
+                        auto relJump = engine_->Assembly()->GenerateJump(baseAddr, targetAddr);
+                        if (!relJump.empty() && relJump[0] == 0xE9) {
+                            // Use relative jump
+                            std::cout << "[DEBUG] Replacing with E9 relative jump" << std::endl;
+
+                            // Write the relative jump
+                            if (!engine_->Memory()->WriteMemory(baseAddr, relJump.data(), relJump.size())) {
+                                DWORD error = GetLastError();
+                                throw EngineException(ErrorCode::MemoryAccessError,
+                                    "Failed to write relative jump at: 0x" +
+                                    std::to_string(baseAddr) + ", error: " + std::to_string(error));
+                            }
+
+                            // Verify write
+                            std::vector<uint8_t> verify(relJump.size());
+                            if (engine_->Memory()->ReadMemory(baseAddr, verify.data(), verify.size())) {
+                                std::cout << "[DEBUG] Hook installed: ";
+                                for (size_t i = 0; i < verify.size(); ++i) {
+                                    std::cout << std::hex << std::setw(2) << std::setfill('0')
+                                        << (int)verify[i] << " ";
+                                }
+                                std::cout << std::dec << std::endl;
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // Normal write
                 std::cout << "[DEBUG] Writing " << code.size() << " bytes to 0x"
                     << std::hex << baseAddr << " for label '" << label << "': ";
 
