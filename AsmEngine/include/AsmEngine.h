@@ -89,6 +89,12 @@ namespace AsmEngine {
         bool CreateDetour(const std::string& targetSymbol,
             const std::string& detourCode);
 
+        // Hook management
+        bool CreateHook(AddressType targetAddress, const std::string& hookCode,
+            const std::string& description = "");
+        bool RemoveHook(AddressType targetAddress);
+        std::vector<std::pair<AddressType, AddressType>> GetActiveHooks() const;
+
         // Write assembly at address
         bool WriteAssembly(AddressType address, const std::string& assembly);
         bool WriteAssembly(const std::string& symbol, const std::string& assembly);
@@ -115,6 +121,8 @@ namespace AsmEngine {
         // Error handling
         using ErrorHandler = std::function<void(ErrorCode, const std::string&)>;
         void SetErrorHandler(ErrorHandler handler);
+
+
 
     private:
         ErrorHandler errorHandler_;
